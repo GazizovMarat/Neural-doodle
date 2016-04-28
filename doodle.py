@@ -37,7 +37,7 @@ add_arg('--output-size',    default=None, type=str,         help='Size of the ou
 add_arg('--phases',         default=3, type=int,            help='Number of image scales to process in phases.')
 add_arg('--slices',         default=2, type=int,            help='Split patches up into this number of batches.')
 add_arg('--cache',          default=0, type=int,            help='Whether to compute matches only once.')
-add_arg('--smoothness',     default=1E+0, type=float,       help='Weight of image smoothing scheme.')
+add_arg('--smoothness',     default=0E+0, type=float,       help='Weight of image smoothing scheme.')
 add_arg('--variety',        default=0.0, type=float,        help='Bias toward selecting diverse patches, e.g. 0.5.')
 add_arg('--seed',           default='noise', type=str,      help='Seed image path, "noise" or "content".')
 add_arg('--seed-range',     default='16:240', type=str,     help='Random colors chosen in range, e.g. 0:255.')
@@ -106,8 +106,6 @@ class Model(object):
     """
 
     def __init__(self):
-        self.pixel_mean = np.array([103.939, 116.779, 123.680], dtype=np.float32).reshape((3,1,1))
-
         self.setup_model()
         self.load_data()
 
@@ -118,32 +116,25 @@ class Model(object):
         net, self.channels = {}, {}
 
         # Primary network for the main image. These are convolution only, and stop at layer 4_2 (rest unused).
-        net['img']     = InputLayer((1, 3, None, None))
-        net['conv1_1'] = ConvLayer(net['img'],     64, 3, pad=1)
-        net['conv1_2'] = ConvLayer(net['conv1_1'], 64, 3, pad=1)
-        net['pool1']   = PoolLayer(net['conv1_2'], 2, mode='average_exc_pad')
-        net['conv2_1'] = ConvLayer(net['pool1'],   128, 3, pad=1)
-        net['conv2_2'] = ConvLayer(net['conv2_1'], 128, 3, pad=1)
-        net['pool2']   = PoolLayer(net['conv2_2'], 2, mode='average_exc_pad')
-        net['conv3_1'] = ConvLayer(net['pool2'],   256, 3, pad=1)
-        net['conv3_2'] = ConvLayer(net['conv3_1'], 256, 3, pad=1)
-        net['conv3_3'] = ConvLayer(net['conv3_2'], 256, 3, pad=1)
-        net['conv3_4'] = ConvLayer(net['conv3_3'], 256, 3, pad=1)
-        net['pool3']   = PoolLayer(net['conv3_4'], 2, mode='average_exc_pad')
-        net['conv4_1'] = ConvLayer(net['pool3'],   512, 3, pad=1)
-        net['conv4_2'] = ConvLayer(net['conv4_1'], 512, 3, pad=1)
-        net['conv4_3'] = ConvLayer(net['conv4_2'], 512, 3, pad=1)
-        net['conv4_4'] = ConvLayer(net['conv4_3'], 512, 3, pad=1)
-        net['pool4']   = PoolLayer(net['conv4_4'], 2, mode='average_exc_pad')
-        net['conv5_1'] = ConvLayer(net['pool4'],   512, 3, pad=1)
-        net['conv5_2'] = ConvLayer(net['conv5_1'], 512, 3, pad=1)
-        net['conv5_3'] = ConvLayer(net['conv5_2'], 512, 3, pad=1)
-        net['conv5_4'] = ConvLayer(net['conv5_3'], 512, 3, pad=1)
-        net['main']    = net['conv5_4']
+        custom = {'nonlinearity': lasagne.nonlinearities.elu}
+        net['img']    = InputLayer((None, 3, None, None))
+        net['conv1_1'] = ConvLayer(net['img'],    64, 5, pad=2, **custom)
+        net['conv1_2'] = ConvLayer(net['conv1_1'], 64, 3, pad=1, **custom)
+        net['conv1_3'] = ConvLayer(net['conv1_2'], 64, 4, pad=1, stride=(2,2), **custom)
+        net['conv2_1'] = ConvLayer(net['conv1_3'], 128, 3, pad=1, **custom)
+        net['conv2_2'] = ConvLayer(net['conv2_1'], 128, 3, pad=1, **custom)
+        net['conv2_3'] = ConvLayer(net['conv2_2'], 128, 4, pad=1, stride=(2,2), **custom)
+        net['conv3_1'] = ConvLayer(net['conv2_3'], 192, 3, pad=1, **custom)
+        net['conv3_2'] = ConvLayer(net['conv3_1'], 192, 3, pad=1, **custom)
+        net['conv3_3'] = ConvLayer(net['conv3_2'], 192, 4, pad=1, stride=(2,2), **custom)
+        net['conv4_1'] = ConvLayer(net['conv3_3'], 256, 3, pad=1, **custom)
+        net['conv4_2'] = ConvLayer(net['conv4_1'], 256, 3, pad=1, **custom)
+        net['conv4_3'] = ConvLayer(net['conv4_2'], 256, 4, pad=1, stride=(2,2), **custom)
+        net['main']   = net['conv4_3']
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
         net['map'] = InputLayer((1, 1, None, None))
-        for j, i in itertools.product(range(5), range(4)):
+        for j, i in itertools.product(range(4), range(3)):
             if j < 2 and i > 1: continue
             suffix = '%i_%i' % (j+1, i+1)
 
@@ -164,14 +155,17 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        vgg19_file = os.path.join(os.path.dirname(__file__), 'vgg19_conv.pkl.bz2')
-        if not os.path.exists(vgg19_file):
+        data_file = os.path.join(os.path.dirname(__file__), 'wgg_conv.pkl.bz2')
+        if not os.path.exists(data_file):
             error("Model file with pre-trained convolution layers not found. Download here...",
                   "https://github.com/alexjc/neural-doodle/releases/download/v0.0/vgg19_conv.pkl.bz2")
 
-        data = pickle.load(bz2.open(vgg19_file, 'rb'))
-        params = lasagne.layers.get_all_param_values(self.network['main'])
-        lasagne.layers.set_all_param_values(self.network['main'], data[:len(params)])
+        data = pickle.load(bz2.open(data_file, 'rb'))
+        for layer, values in data.items():
+            layer = layer.replace('enc', 'conv')
+            if layer not in self.network: continue
+            for p, v in zip(self.network[layer].get_params(), values):
+                p.set_value(v)
 
     def setup(self, layers):
         """Setup the inputs and outputs, knowing the layers that are required by the optimization algorithm.
@@ -193,7 +187,7 @@ class Model(object):
         the resolution.
         """
         image = np.swapaxes(np.swapaxes(image, 1, 2), 0, 1)[::-1, :, :]
-        image = image.astype(np.float32) - self.pixel_mean
+        image = image.astype(np.float32) / 127.5 - 1.0
         return image[np.newaxis]
 
     def finalize_image(self, image, resolution):
@@ -514,7 +508,7 @@ class NeuralGenerator(object):
         """Callback for the L-BFGS optimization that computes the loss and gradients on the GPU.
         """
         # Adjust the representation to be compatible with the model before computing results.
-        current_img = Xn.reshape(self.content_img.shape).astype(np.float32) - self.model.pixel_mean
+        current_img = Xn.reshape(self.content_img.shape).astype(np.float32) / 127.5 - 1.0
         current_features = self.compute_features(current_img, self.content_map)
 
         # Iterate through each of the style layers one by one, computing best matches.
@@ -548,7 +542,7 @@ class NeuralGenerator(object):
 
         # Print more information to the console every few iterations.
         if args.print_every and self.frame % args.print_every == 0:
-            print('{:>3}   {}loss{} {:8.2e} '.format(self.frame, ansi.BOLD, ansi.ENDC, loss / 1000.0), end='')
+            print('{:>3}   {}loss{} {:8.2e} '.format(self.frame, ansi.BOLD, ansi.ENDC, loss / 1.0), end='')
             category = ''
             for v, l in zip(losses, self.losses):
                 if l[0] == 'smooth':
@@ -556,7 +550,7 @@ class NeuralGenerator(object):
                 if l[0] != category:
                     print('  {}{}{}'.format(ansi.BOLD, l[0], ansi.ENDC), end='')
                     category = l[0]
-                print(' {}{}{} {:8.2e} '.format(ansi.BOLD, l[1], ansi.ENDC, v / 1000.0), end='')
+                print(' {}{}{} {:8.2e} '.format(ansi.BOLD, l[1], ansi.ENDC, v / 1.0), end='')
 
             current_time = time.time()
             quality = 100.0 - 100.0 * np.sqrt(self.error / 255.0)
