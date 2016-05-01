@@ -128,9 +128,8 @@ class Model(object):
 
         ## net['pool2']   = PoolLayer(net['conv2_2'], 2, mode='max')
         ## net['conv3_1'] = ConvLayer(net['pool2'], 112, 3, pad=1, **custom)
-        net['conv3_1'] = ConvLayer(net['conv2_1'], 112, 2, pad=0, stride=(2,2), **custom)
+        net['conv3_1'] = ConvLayer(net['conv2_2'], 112, 2, pad=0, stride=(2,2), **custom)
         net['conv3_2'] = ConvLayer(net['conv3_1'], 112, 3, pad=1, **custom)
-        net['conv3_3'] = ConvLayer(net['conv3_2'], 112, 3, pad=1, **custom)
 
         # net['pool3']   = PoolLayer(net['conv3_3'], 2, mode='max')
         # net['conv4_1'] = ConvLayer(net['pool3'], 176, 3, pad=1, **custom)
