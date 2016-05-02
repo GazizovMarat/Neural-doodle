@@ -25,11 +25,11 @@ parser = argparse.ArgumentParser(description='Generate a new image by applying s
 add_arg = parser.add_argument
 
 add_arg('--content',        default=None, type=str,         help='Content image path as optimization target.')
-add_arg('--content-weight', default=10.0, type=float,       help='Weight of content relative to style.')
-add_arg('--content-layers', default='4_2', type=str,        help='The layer with which to match content.')
+add_arg('--content-weight', default=2500.0, type=float,       help='Weight of content relative to style.')
+add_arg('--content-layers', default='4_1', type=str,        help='The layer with which to match content.')
 add_arg('--style',          default=None, type=str,         help='Style image path to extract patches.')
-add_arg('--style-weight',   default=25.0, type=float,       help='Weight of style relative to content.')
-add_arg('--style-layers',   default='3_1,4_1', type=str,    help='The layers to match style patches.')
+add_arg('--style-weight',   default=2500.0, type=float,       help='Weight of style relative to content.')
+add_arg('--style-layers',   default='4_1,3_1', type=str,        help='The layers to match style patches.')
 add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=10.0, type=float,      help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str, help='Output image path to save once done.')
@@ -118,24 +118,20 @@ class Model(object):
         # Primary network for the main image. These are convolution only, and stop at layer 4_2 (rest unused).
         custom = {'nonlinearity': lasagne.nonlinearities.elu}
         net['img']    = InputLayer((None, 3, None, None))
-        net['conv1_1'] = ConvLayer(net['img'],    64, 5, pad=2, **custom)
-        net['conv1_2'] = ConvLayer(net['conv1_1'], 64, 3, pad=1, **custom)
-        net['conv1_3'] = ConvLayer(net['conv1_2'], 64, 4, pad=1, stride=(2,2), **custom)
-        net['conv2_1'] = ConvLayer(net['conv1_3'], 128, 3, pad=1, **custom)
-        net['conv2_2'] = ConvLayer(net['conv2_1'], 128, 3, pad=1, **custom)
-        net['conv2_3'] = ConvLayer(net['conv2_2'], 128, 4, pad=1, stride=(2,2), **custom)
-        net['conv3_1'] = ConvLayer(net['conv2_3'], 192, 3, pad=1, **custom)
-        net['conv3_2'] = ConvLayer(net['conv3_1'], 192, 3, pad=1, **custom)
-        net['conv3_3'] = ConvLayer(net['conv3_2'], 192, 4, pad=1, stride=(2,2), **custom)
-        net['conv4_1'] = ConvLayer(net['conv3_3'], 256, 3, pad=1, **custom)
-        net['conv4_2'] = ConvLayer(net['conv4_1'], 256, 3, pad=1, **custom)
-        net['conv4_3'] = ConvLayer(net['conv4_2'], 256, 4, pad=1, stride=(2,2), **custom)
-        net['main']   = net['conv4_3']
+        net['conv1_1'] = ConvLayer(net['img'],      48, 3, pad=1, **custom)
+        net['conv1_2'] = ConvLayer(net['conv1_1'],  48, 3, pad=1, **custom)
+        net['conv2_1'] = ConvLayer(net['conv1_2'],  72, 2, pad=0, stride=(2,2), **custom)
+        net['conv2_2'] = ConvLayer(net['conv2_1'],  72, 3, pad=1, **custom)
+        net['conv3_1'] = ConvLayer(net['conv2_2'],  96, 2, pad=0, stride=(2,2), **custom)
+        net['conv3_2'] = ConvLayer(net['conv3_1'],  96, 3, pad=1, **custom)
+        net['conv3_3'] = ConvLayer(net['conv3_2'],  96, 3, pad=1, **custom)
+        net['conv4_1'] = ConvLayer(net['conv3_2'], 120, 2, pad=0, stride=(2,2), **custom)
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
         net['map'] = InputLayer((1, 1, None, None))
         for j, i in itertools.product(range(4), range(3)):
-            if j < 2 and i > 1: continue
+            if j < 3 and i > 1: continue
+            if j == 3 and i > 0: continue
             suffix = '%i_%i' % (j+1, i+1)
 
             if i == 0:
@@ -155,7 +151,7 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        data_file = os.path.join(os.path.dirname(__file__), 'wgg_conv.pkl.bz2')
+        data_file = os.path.join(os.path.dirname(__file__), 'ngg_conv.pkl.bz2')
         if not os.path.exists(data_file):
             error("Model file with pre-trained convolution layers not found. Download here...",
                   "https://github.com/alexjc/neural-doodle/releases/download/v0.0/vgg19_conv.pkl.bz2")
@@ -165,6 +161,7 @@ class Model(object):
             layer = layer.replace('enc', 'conv')
             if layer not in self.network: continue
             for p, v in zip(self.network[layer].get_params(), values):
+                assert p.get_value().shape == v.shape, "Layer {}: Expected size {}.".format(layer, v.shape)
                 p.set_value(v)
 
     def setup(self, layers):
@@ -542,7 +539,7 @@ class NeuralGenerator(object):
 
         # Print more information to the console every few iterations.
         if args.print_every and self.frame % args.print_every == 0:
-            print('{:>3}   {}loss{} {:8.2e} '.format(self.frame, ansi.BOLD, ansi.ENDC, loss / 1.0), end='')
+            print('{:>3}   {}loss{} {:8.2e} '.format(self.frame, ansi.BOLD, ansi.ENDC, float(loss)), end='')
             category = ''
             for v, l in zip(losses, self.losses):
                 if l[0] == 'smooth':
@@ -550,7 +547,7 @@ class NeuralGenerator(object):
                 if l[0] != category:
                     print('  {}{}{}'.format(ansi.BOLD, l[0], ansi.ENDC), end='')
                     category = l[0]
-                print(' {}{}{} {:8.2e} '.format(ansi.BOLD, l[1], ansi.ENDC, v / 1.0), end='')
+                print(' {}{}{} {:8.2e} '.format(ansi.BOLD, l[1], ansi.ENDC, float(v)), end='')
 
             current_time = time.time()
             quality = 100.0 - 100.0 * np.sqrt(self.error / 255.0)
@@ -590,7 +587,7 @@ class NeuralGenerator(object):
             # Setup the seed for the optimization as specified by the user.
             shape = self.content_img.shape[2:]
             if args.seed == 'content':
-                Xn = self.content_img[0] + self.model.pixel_mean
+                Xn = (self.content_img[0] + 1.0) * 127.5
             if args.seed == 'noise':
                 bounds = [int(i) for i in args.seed_range.split(':')]
                 Xn = np.random.uniform(bounds[0], bounds[1], shape + (3,)).astype(np.float32)
