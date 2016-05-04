@@ -2,7 +2,6 @@ Neural Doodle
 =============
 
 .. image:: docs/Workflow.gif
-    :align: right
 
 Use a deep neural network to borrow the skills of real artists and turn your two-bit doodles into masterpieces! This project is an implementation of `Semantic Style Transfer <http://arxiv.org/abs/1603.01768>`_ (Champandard, 2016), based on the `Neural Patches <http://arxiv.org/abs/1601.04589>`_ algorithm (Li, 2016). Read more about the motivation in this `in-depth article <https://nucl.ai/blog/neural-doodles/>`_ and watch this `workflow video <https://www.youtube.com/watch?v=fu2fzx4w3mI>`_ for inspiration.
 
@@ -11,7 +10,7 @@ The ``doodle.py`` script generates a new image by using one, two, three or four 
 **NOTE**: Making a ``#NeuralDoodle`` is a skill. The parameters in the script were adjusted to work well by default and with the examples below. For new images, you may need to adjust values and modify on your input data too. It takes practice, but you can reach almost photo-realistic results if you iterate! (`Ask for advice here or see examples <https://github.com/alexjc/neural-doodle/issues?q=label%3Aadvice>`_.)
 
 1. `Examples & Usage <#1-examples--usage>`_
-2. `Installation <#2-installation-setup>`_
+2. `Installation <#2-installation--setup>`_
 3. `Troubleshooting <#3-troubleshooting-problems>`_
 4. `Frequent Questions <#4-frequent-questions>`_
 
@@ -108,11 +107,38 @@ You can configure the algorithm using the following parameters. Type ``python3 d
 2. Installation & Setup
 =======================
 
+.. image:: docs/DockerConsole.gif
+
+2.a) Using Docker Image (recommended)
+-------------------------------------
+
+The easiest way to get up-and-running is to `install Docker <https://www.docker.com/>`_. Then, you should be able to downloand and run the pre-built image using the `docker` command line tool.  Find out more about the `alexjc/neural-doodle` image on its `Docker Hub https://hub.docker.com/r/alexjc/neural-doodle/>`_ page.
+
+The easiest way to run the script from the docker image is to setup an easy access command called `doodle`. This will automatically:
+
+* Mount the `frames` folder from the current directory into the instance for visualization.
+* Expose the `samples` folder from the current directory so the script can access files!
+
+This is how you can do it in your terminal console on OSX or Linux:
+
+..code:: bash
+    # Setup the alias. Put this in your .bash_rc or .zshrc file so it's available at startup.
+    alias doodle="docker run -v samples:/nd/samples -w /nd/samples \
+                             -v frames:/nd/frames -w /nd/frames \
+                             -it alexjc/neural-doodle"
+    
+    # Now run any of the examples above using this alias, without the `.py` extension.
+    doodle --help
+
+*NOTE*: If you want to run on your NVIDIA GPU, you can instead use the image `alexjc/neural-doodle:gpu` which comes with CUDA and CUDNN pre-installed in the image.  See the scripts in `docker/*.sh` for how to setup your host machine. (advanced)
+
+2.b) Manual Installation (optional)
+-----------------------------------
+
 This project requires Python 3.4+ and you'll also need ``numpy`` and ``scipy`` (numerical computing libraries) as well as ``python3-dev`` installed system-wide.  If you want more detailed instructions, follow these:
 
-0. Use Prepared `Docker Container <https://github.com/alexjc/neural-doodle/issues/61>`_ or `Amazon Image <https://github.com/alexjc/neural-doodle/issues/54>`_ **(beginner)**
-1. `Linux Installation of Lasagne <https://github.com/Lasagne/Lasagne/wiki/From-Zero-to-Lasagne-on-Ubuntu-14.04>`_ **(recommended)**
-2. `Mac OSX Installation of Lasagne <http://deeplearning.net/software/theano/install.html#mac-os>`_ **(intermediate)**
+1. `Linux Installation of Lasagne <https://github.com/Lasagne/Lasagne/wiki/From-Zero-to-Lasagne-on-Ubuntu-14.04>`_ **(intermediate)**
+2. `Mac OSX Installation of Lasagne <http://deeplearning.net/software/theano/install.html#mac-os>`_ **(advanced)**
 3. `Windows Installation of Lasagne <https://github.com/Lasagne/Lasagne/wiki/From-Zero-to-Lasagne-on-Windows-7-%2864-bit%29>`_ **(expert)**
 
 Afterward fetching the repository, you can run the following commands from your terminal to setup a local environment:
