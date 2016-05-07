@@ -43,8 +43,8 @@ add_arg('--seed',           default='content', type=str,    help='Seed image pat
 add_arg('--seed-range',     default='16:240', type=str,     help='Random colors chosen in range, e.g. 0:255.')
 add_arg('--iterations',     default=100, type=int,          help='Number of iterations to run each resolution.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
-add_arg('--print-every',    default=10, type=int,           help='How often to log statistics to stdout.')
-add_arg('--save-every',     default=10, type=int,           help='How frequently to save PNG into `frames`.')
+add_arg('--print-every',    default=1, type=int,           help='How often to log statistics to stdout.')
+add_arg('--save-every',     default=1, type=int,           help='How frequently to save PNG into `frames`.')
 args = parser.parse_args()
 
 
@@ -553,6 +553,26 @@ class NeuralGenerator(object):
         if np.isnan(output).any():
             raise OverflowError("Optimization diverged; try using a different device or parameters.")
 
+        # Dump the image to disk if requested by the user.
+        if args.save_every and self.frame % args.save_every == 0:
+            frame = Xn.reshape(self.content_img.shape[1:])
+            resolution = self.content_img_original.shape
+            image = scipy.misc.toimage(self.model.finalize_image(frame, resolution), cmin=0, cmax=255)
+            image.save('frames/%04d.png'%self.frame)
+
+        # Print more information to the console every few iterations.
+        if args.print_every and self.frame % args.print_every == 0:
+            print('{:>3}   '.format(self.frame, ansi.BOLD, ansi.ENDC), end='')
+
+            current_time = time.time()
+            quality = 100.0 - 100.0 * np.sqrt(self.error / 255.0)
+            print('  {}time{} {:3.1f}s '.format(ansi.BOLD, ansi.ENDC, current_time - self.iter_time), flush=True)
+            self.iter_time = current_time
+
+        # Update counters and timers.
+        self.frame += 1
+        self.iteration += 1
+
         return output
 
     def run(self):
@@ -580,22 +600,18 @@ class NeuralGenerator(object):
             # Setup the seed for the optimization as specified by the user.
             shape = self.content_img.shape[2:]
             if args.seed == 'content':
-                print(self.content_img[0].min(), self.content_img[0].max())
                 Xn = (self.content_img[0] + 1.0) * 127.5
             if args.seed == 'noise':
-                assert False
                 bounds = [int(i) for i in args.seed_range.split(':')]
                 Xn = np.random.uniform(bounds[0], bounds[1], shape + (3,)).astype(np.float32)
             if args.seed == 'previous':
-                assert False
                 Xn = scipy.misc.imresize(Xn[0], shape, interp='bicubic')
                 Xn = Xn.transpose((2, 0, 1))[np.newaxis]
             if os.path.exists(args.seed):
-                assert False
                 seed_image = scipy.ndimage.imread(args.seed, mode='RGB')
                 seed_image = scipy.misc.imresize(seed_image, shape, interp='bicubic')
                 self.seed_image = self.model.prepare_image(seed_image)
-                Xn = self.seed_image[0] + self.model.pixel_mean
+                Xn = (self.seed_image[0] + 1.0) * 127.5
             if Xn is None:
                 error("Seed for optimization was not found. You can either...",
                       "  - Set the `--seed` to `content` or `noise`.", "  - Specify `--seed` as a valid filename.")
@@ -604,7 +620,9 @@ class NeuralGenerator(object):
             data_bounds = np.zeros((np.product(Xn.shape), 2), dtype=np.float64)
             data_bounds[:] = (0.0, 255.0)
 
-            Xn = self.evaluate(Xn)
+            self.iter_time, self.iteration, interrupt = time.time(), 0, False
+            for _ in range(args.iterations):
+                Xn = self.evaluate(Xn)
 
             args.seed = 'previous'
             resolution = self.content_img.shape
@@ -612,7 +630,6 @@ class NeuralGenerator(object):
 
             output = self.model.finalize_image(Xn[0], self.content_img_original.shape)
             scipy.misc.toimage(output, cmin=0, cmax=255).save(args.output)
-            break
 
         interrupt = False
         status = "finished in" if not interrupt else "interrupted at"
