@@ -122,25 +122,27 @@ class Model(object):
         custom = {'nonlinearity': lasagne.nonlinearities.elu}
         # Encoder part of the neural network, takes an input image and turns it into abstract patterns.
         net['img']    = input or InputLayer((1, 3, None, None))
-        net['enc1_1'] = ConvLayer(net['img'],     48, 3, pad=1, **custom)
-        net['enc1_2'] = ConvLayer(net['enc1_1'],  48, 3, pad=1, **custom)
-        net['enc2_1'] = ConvLayer(net['enc1_2'],  96, 2, pad=0, stride=(2,2), **custom)
-        net['enc2_2'] = ConvLayer(net['enc2_1'],  96, 3, pad=1, **custom)
-        net['enc3_1'] = ConvLayer(net['enc2_2'], 192, 2, pad=0, stride=(2,2), **custom)
-        net['enc3_2'] = ConvLayer(net['enc3_1'], 192, 3, pad=1, **custom)
-        net['enc3_3'] = ConvLayer(net['enc3_2'], 192, 3, pad=1, **custom)
-        net['enc4_1'] = ConvLayer(net['enc3_3'], 384, 2, pad=0, stride=(2,2), **custom)
+        net['enc1_1'] = ConvLayer(net['img'],     32, 3, pad=1, **custom)
+        net['enc1_2'] = ConvLayer(net['enc1_1'],  32, 3, pad=1, **custom)
+        net['enc2_1'] = ConvLayer(net['enc1_2'],  64, 2, pad=0, stride=(2,2), **custom)
+        net['enc2_2'] = ConvLayer(net['enc2_1'],  64, 3, pad=1, **custom)
+        net['enc3_1'] = ConvLayer(net['enc2_2'], 128, 2, pad=0, stride=(2,2), **custom)
+        net['enc3_2'] = ConvLayer(net['enc3_1'], 128, 3, pad=1, **custom)
+        net['enc3_3'] = ConvLayer(net['enc3_2'], 128, 3, pad=1, **custom)
+        net['enc3_4'] = ConvLayer(net['enc3_3'], 128, 3, pad=1, **custom)
+        net['enc4_1'] = ConvLayer(net['enc3_4'], 256, 2, pad=0, stride=(2,2), **custom)
 
         # Decoder part of the neural network, takes abstract patterns and converts them into an image!
         self.tensor_middle = T.tensor4()
-        net['mid']    = InputLayer((1, 384, None, None), var=self.tensor_middle)
-        net['dec4_1'] = DecvLayer(net['enc4_1'], net['mid'],    192)
-        net['dec3_3'] = DecvLayer(net['enc3_3'], net['dec4_1'], 192)
-        net['dec3_2'] = DecvLayer(net['enc3_2'], net['dec3_3'], 192)
-        net['dec3_1'] = DecvLayer(net['enc3_1'], net['dec3_2'],  96)
-        net['dec2_2'] = DecvLayer(net['enc2_2'], net['dec3_1'],  96)
-        net['dec2_1'] = DecvLayer(net['enc2_1'], net['dec2_2'],  48)
-        net['dec1_2'] = DecvLayer(net['enc1_2'], net['dec2_1'],  48)
+        net['mid']    = InputLayer((1, 128, None, None), var=self.tensor_middle)
+        net['dec4_1'] = DecvLayer(net['enc4_1'], net['mid'],    128)
+        net['dec3_4'] = DecvLayer(net['enc3_4'], net['dec4_1'], 128)
+        net['dec3_3'] = DecvLayer(net['enc3_3'], net['dec3_4'], 128)
+        net['dec3_2'] = DecvLayer(net['enc3_2'], net['dec3_3'], 128)
+        net['dec3_1'] = DecvLayer(net['enc3_1'], net['dec3_2'],  64)
+        net['dec2_2'] = DecvLayer(net['enc2_2'], net['dec3_1'],  64)
+        net['dec2_1'] = DecvLayer(net['enc2_1'], net['dec2_2'],  32)
+        net['dec1_2'] = DecvLayer(net['enc1_2'], net['dec2_1'],  32)
         net['dec1_1'] = DecvLayer(net['enc1_1'], net['dec1_2'],   3, nonlinearity=lasagne.nonlinearities.tanh)
         net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec1_1'])
         net['out'] = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
@@ -168,10 +170,10 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        data_file = os.path.join(os.path.dirname(__file__), 'bgg_conv.pkl.bz2')
+        data_file = os.path.join(os.path.dirname(__file__), 'gelu2_conv.pkl.bz2')
         if not os.path.exists(data_file):
             error("Model file with pre-trained convolution layers not found. Download here...",
-                  "https://github.com/alexjc/neural-doodle/releases/download/v0.0/vgg19_conv.pkl.bz2")
+                  "https://github.com/alexjc/neural-doodle/releases/download/v0.0/")
 
         data = pickle.load(bz2.open(data_file, 'rb'))
         for layer, values in data.items():
@@ -420,7 +422,7 @@ class NeuralGenerator(object):
         # Compute the score of each patch, taking into account statistics from previous iteration. This equalizes
         # the chances of the patches being selected when the user requests more variety.
         offset = self.matcher_history[layer].reshape((-1, 1))
-        scores = (dist - offset * args.variety)
+        scores = dist - offset * args.variety
         # Pick the best style patches for each patch in the current image, the result is an array of indices.
         # Also return the maximum value along both axis, used to compare slices and add patch variety.
         return [scores.argmax(axis=0), scores.max(axis=0), dist.max(axis=1)]
@@ -533,7 +535,7 @@ class NeuralGenerator(object):
             self.matcher_tensors[l].set_value(f)
 
             # Compute best matching patches this style layer, going through all slices.
-            warmup = bool(args.variety > 0.0)
+            warmup = bool(self.iteration == 0 and args.variety > 0.0)
             for _ in range(2 if warmup else 1):
                 best_idx = self.evaluate_slices(f, l)
 
@@ -547,7 +549,8 @@ class NeuralGenerator(object):
         better_shape = current_features[-1].shape[2:] + (channels,)
         better_features = reconstruct_from_patches_2d(better_patches, better_shape)
 
-        f = better_features.transpose((2, 0, 1))[np.newaxis] # current_features[0][:,:channels]
+        f = better_features.transpose((2, 0, 1))[np.newaxis]
+        # f = current_features[0][:,:channels]
         output = self.compute_output(f)
 
         if np.isnan(output).any():
