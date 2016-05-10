@@ -29,7 +29,7 @@ add_arg('--content-weight', default=2500.0, type=float,     help='Weight of cont
 add_arg('--content-layers', default='4_1', type=str,        help='The layer with which to match content.')
 add_arg('--style',          default=None, type=str,         help='Style image path to extract patches.')
 add_arg('--style-weight',   default=2500.0, type=float,     help='Weight of style relative to content.')
-add_arg('--style-layers',   default='4_1', type=str,        help='The layers to match style patches.')
+add_arg('--style-layers',   default='4_1,3_1', type=str,    help='The layers to match style patches.')
 add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=10.0, type=float,      help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str, help='Output image path to save once done.')
@@ -80,6 +80,7 @@ os.environ.setdefault('THEANO_FLAGS', 'floatX=float32,device={},force_device=Tru
 import numpy as np
 import scipy.optimize, scipy.ndimage, scipy.misc
 import PIL
+from sklearn.feature_extraction.image import reconstruct_from_patches_2d
 
 # Numeric Computing (GPU)
 import theano
@@ -133,19 +134,22 @@ class Model(object):
         net['enc4_1'] = ConvLayer(net['enc3_4'], 256, 2, pad=0, stride=(2,2), **custom)
 
         # Decoder part of the neural network, takes abstract patterns and converts them into an image!
-        self.tensor_middle = T.tensor4()
-        net['mid']    = InputLayer((1, 128, None, None), var=self.tensor_middle)
-        net['dec4_1'] = DecvLayer(net['enc4_1'], net['mid'],    128)
+        self.tensor_latent = [T.tensor4(), T.tensor4()]
+        net['lat4_1'] = InputLayer((1, 256, None, None), var=self.tensor_latent[0])
+        net['dec4_1'] = DecvLayer(net['enc4_1'], net['lat4_1'], 128)
         net['dec3_4'] = DecvLayer(net['enc3_4'], net['dec4_1'], 128)
         net['dec3_3'] = DecvLayer(net['enc3_3'], net['dec3_4'], 128)
         net['dec3_2'] = DecvLayer(net['enc3_2'], net['dec3_3'], 128)
-        net['dec3_1'] = DecvLayer(net['enc3_1'], net['dec3_2'],  64)
+        net['out4_1'] = net['dec3_2']
+        
+        net['lat3_1'] = InputLayer((1, 128, None, None), var=self.tensor_latent[1])
+        net['dec3_1'] = DecvLayer(net['enc3_1'], net['lat3_1'],  64)
         net['dec2_2'] = DecvLayer(net['enc2_2'], net['dec3_1'],  64)
         net['dec2_1'] = DecvLayer(net['enc2_1'], net['dec2_2'],  32)
         net['dec1_2'] = DecvLayer(net['enc1_2'], net['dec2_1'],  32)
         net['dec1_1'] = DecvLayer(net['enc1_1'], net['dec1_2'],   3, nonlinearity=lasagne.nonlinearities.tanh)
         net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec1_1'])
-        net['out'] = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
+        net['out3_1'] = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
         net['map'] = InputLayer((1, 1, None, None))
@@ -391,8 +395,11 @@ class NeuralGenerator(object):
         self.compute_matches = {l: self.compile([self.matcher_history[l]], self.do_match_patches(l))\
                                                 for l in self.style_layers}
 
-        output = lasagne.layers.get_output(self.model.network['out'], {self.model.network['mid']: self.model.tensor_middle})
-        self.compute_output = self.compile([self.model.tensor_middle], output)
+        self.compute_output = []
+        for layer, tensor in zip(self.style_layers, self.model.tensor_latent):
+            output = lasagne.layers.get_output(self.model.network['out'+layer], {self.model.network['lat'+layer]: tensor})
+            fn = self.compile([tensor], output)
+            self.compute_output.append(fn)
 
 
     #------------------------------------------------------------------------------------------------------------------
@@ -528,9 +535,10 @@ class NeuralGenerator(object):
         current_features = self.compute_features(current_img, self.content_map)
 
         # Iterate through each of the style layers one by one, computing best matches.
-        current_best = []
-        for l, ff in zip(self.style_layers, current_features):
-            f = np.copy(ff)
+        desired_features = current_features[0]
+
+        for l, ff, compute in zip(self.style_layers, current_features, self.compute_output):
+            f = np.copy(desired_features)
             self.normalize_components(l, f, self.compute_norms(np, l, f))
             self.matcher_tensors[l].set_value(f)
 
@@ -540,19 +548,19 @@ class NeuralGenerator(object):
                 best_idx = self.evaluate_slices(f, l)
 
             patches = self.style_data[l][0]
-            current_best.append(patches[best_idx].astype(np.float32))
+            print('layer', l, 'patches', len(set(best_idx)), '/', best_idx.shape[0])
+            current_best = patches[best_idx].astype(np.float32)
 
-        from sklearn.feature_extraction.image import reconstruct_from_patches_2d
+            channels = self.model.channels[l]
+            better_patches = current_best[:,:channels].transpose((0, 2, 3, 1))
+            better_shape = f.shape[2:] + (channels,)
+            better_features = reconstruct_from_patches_2d(better_patches, better_shape)
 
-        channels = self.model.channels[self.style_layers[-1]]
-        better_patches = current_best[-1][:,:channels].transpose((0, 2, 3, 1))
-        better_shape = current_features[-1].shape[2:] + (channels,)
-        better_features = reconstruct_from_patches_2d(better_patches, better_shape)
+            f = better_features.transpose((2, 0, 1))[np.newaxis]
+            # f = current_features[0][:,:channels]
+            desired_features = compute(f)
 
-        f = better_features.transpose((2, 0, 1))[np.newaxis]
-        # f = current_features[0][:,:channels]
-        output = self.compute_output(f)
-
+        output = desired_features
         if np.isnan(output).any():
             raise OverflowError("Optimization diverged; try using a different device or parameters.")
 
@@ -596,7 +604,7 @@ class NeuralGenerator(object):
             self.prepare_style(scale)
 
             # Now setup the model with the new data, ready for the optimization loop.
-            self.model.setup(layers=['out'] + ['sem'+l for l in self.style_layers] + ['enc'+l for l in self.used_layers])
+            self.model.setup(layers=['out4_1', 'out3_1'] + ['sem'+l for l in self.style_layers] + ['enc'+l for l in self.used_layers])
             self.prepare_optimization()
             print('{}'.format(ansi.ENDC))
 
