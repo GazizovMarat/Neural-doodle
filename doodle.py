@@ -26,12 +26,12 @@ add_arg = parser.add_argument
 
 add_arg('--content',        default=None, type=str,         help='Subject image path to repaint in new style.')
 add_arg('--style',          default=None, type=str,         help='Texture image path to extract patches from.')
-add_arg('--balance',        default=0.8, type=float,        help='Weight of content relative to style.')
+add_arg('--balance',        default=1.0, type=float,        help='Weight of style relative to content.')
 add_arg('--variety',        default=0.0, type=float,        help='Bias toward selecting diverse patches, e.g. 0.5.')
 add_arg('--layers',         default='4_1', type=str,        help='The layer with which to match content.')
 add_arg('--shapes',         default='3,2', type=str,        help='Size of kernels used for patch extraction.')
 add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
-add_arg('--semantic-weight', default=10.0, type=float,      help='Global weight of semantics vs. features.')
+add_arg('--semantic-weight', default=3.0, type=float,      help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str, help='Output image path to save once done.')
 add_arg('--output-size',    default=None, type=str,         help='Size of the output image, e.g. 512x512.')
 add_arg('--phases',         default=2, type=int,            help='Number of image scales to process in phases.')
@@ -39,7 +39,7 @@ add_arg('--slices',         default=2, type=int,            help='Split patches 
 add_arg('--cache',          default=0, type=int,            help='Whether to compute matches only once.')
 add_arg('--seed',           default='content', type=str,    help='Seed image path, "noise" or "content".')
 add_arg('--seed-range',     default='16:240', type=str,     help='Random colors chosen in range, e.g. 0:255.')
-add_arg('--iterations',     default=2, type=int,            help='Number of iterations to run each resolution.')
+add_arg('--iterations',     default=3, type=int,            help='Number of iterations to run each resolution.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
 add_arg('--print-every',    default=1, type=int,            help='How often to log statistics to stdout.')
 add_arg('--save-every',     default=1, type=int,            help='How frequently to save PNG into `frames`.')
@@ -540,7 +540,7 @@ class NeuralGenerator(object):
         return best_idx, best_val
 
     def evaluate(self, Xn):
-        """Callback for the L-BFGS optimization that computes the loss and gradients on the GPU.
+        """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
 
         if args.print_every and self.frame % args.print_every == 0:
@@ -551,10 +551,10 @@ class NeuralGenerator(object):
         current_features = self.compute_features(current_img, self.content_map)
 
         # Iterate through each of the style layers one by one, computing best matches.
-        desired_features = current_features[0]
+        desired_feature = current_features[0]
 
-        for l, ff, compute in zip(self.layers, current_features, self.compute_output):
-            f = np.copy(ff)
+        for l, current_feature, compute in zip(self.layers, current_features, self.compute_output):
+            f = np.copy(desired_feature)
             self.normalize_components(l, f, self.compute_norms(np, l, f))
             self.matcher_tensors[l].set_value(f)
 
@@ -575,13 +575,12 @@ class NeuralGenerator(object):
             better_shape = f.shape[2:] + (channels,)
             better_features = reconstruct_from_patches_2d(better_patches, better_shape)
 
-            f = better_features.transpose((2, 0, 1))[np.newaxis]
-            # f = current_features[0][:,:channels]
-            desired_features = compute(f, self.content_map)
+            f = (1.0 - args.balance) * current_feature[:,:channels]\
+              + (0.0 + args.balance) * better_features.transpose((2, 0, 1))[np.newaxis] 
+            desired_feature = compute(f, self.content_map)
 
-        output = desired_features
-        if np.isnan(output).any():
-            raise OverflowError("Optimization diverged; try using a different device or parameters.")
+            if np.isnan(desired_feature).any():
+                raise OverflowError("Optimization diverged; try using a different device or parameters.")
 
         # Dump the image to disk if requested by the user.
         if args.save_every and self.frame % args.save_every == 0:
@@ -600,7 +599,7 @@ class NeuralGenerator(object):
         self.frame += 1
         self.iteration += 1
 
-        return output
+        return desired_feature
 
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
