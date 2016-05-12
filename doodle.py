@@ -19,14 +19,14 @@ import itertools
 import collections
 
 
-# Configure all options first so we can custom load other libraries (Theano) based on device specified by user.
+# Configure all options first so we can later custom-load other libraries (Theano) based on device specified by user.
 parser = argparse.ArgumentParser(description='Generate a new image by applying style onto a content image.',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 add_arg = parser.add_argument
 
 add_arg('--content',        default=None, type=str,         help='Subject image path to repaint in new style.')
 add_arg('--style',          default=None, type=str,         help='Texture image path to extract patches from.')
-add_arg('--balance',        default=1.0, type=float,        help='Weight of style relative to content.')
+add_arg('--balance',        default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
 add_arg('--variety',        default=0.0, type=float,        help='Bias toward selecting diverse patches, e.g. 0.5.')
 add_arg('--layers',         default=['4_1'], nargs='+', type=str, help='The layer with which to match content.')
 add_arg('--shapes',         default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
@@ -34,12 +34,12 @@ add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension
 add_arg('--semantic-weight', default=3.0, type=float,       help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str,       help='Output image path to save once done.')
 add_arg('--output-size',    default=None, type=str,         help='Size of the output image, e.g. 512x512.')
+add_arg('--iterations',     default=3, type=int,            help='Number of iterations to run at each resolution.')
 add_arg('--phases',         default=2, type=int,            help='Number of image scales to process in phases.')
 add_arg('--slices',         default=2, type=int,            help='Split patches up into this number of batches.')
 add_arg('--cache',          default=0, type=int,            help='Whether to compute matches only once.')
 add_arg('--seed',           default='content', type=str,    help='Seed image path, "noise" or "content".')
 add_arg('--seed-range',     default='16:240', type=str,     help='Random colors chosen in range, e.g. 0:255.')
-add_arg('--iterations',     default=3, type=int,            help='Number of iterations to run each resolution.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
 add_arg('--print-every',    default=1, type=int,            help='How often to log statistics to stdout.')
 add_arg('--save-every',     default=1, type=int,            help='How frequently to save PNG into `frames`.')
@@ -334,10 +334,9 @@ class NeuralGenerator(object):
         return [ni] + [ns]
 
     def normalize_components(self, layer, array, norms):
-        if args.balance > 0.0:
-            array[:,:self.model.channels[layer]] /= (norms[0] * 3.0)
         if args.semantic_weight > 0.0:
             array[:,self.model.channels[layer]:] /= (norms[1] * args.semantic_weight)
+        array[:,:self.model.channels[layer]] /= (norms[0] * 3.0)
 
 
     #------------------------------------------------------------------------------------------------------------------
@@ -347,8 +346,9 @@ class NeuralGenerator(object):
     def rescale_image(self, img, scale):
         """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
         """
+        def snap(value, grid=2**(int(args.layers[0][0])-1)): return int(grid * math.floor(value / grid))
         output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
-        output.thumbnail((int(output.size[0]*scale), int(output.size[1]*scale)), PIL.Image.ANTIALIAS)
+        output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
         return np.asarray(output)
 
     def prepare_content(self, scale=1.0):
