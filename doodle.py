@@ -27,17 +27,16 @@ add_arg = parser.add_argument
 add_arg('--content',        default=None, type=str,         help='Subject image path to repaint in new style.')
 add_arg('--style',          default=None, type=str,         help='Texture image path to extract patches from.')
 add_arg('--balance',        default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
-add_arg('--variety',        default=0.0, type=float,        help='Bias toward selecting diverse patches, e.g. 0.5.')
+add_arg('--variety',        default=[0.0], nargs='+', type=float, help='Bias toward selecting diverse patches, e.g. 0.5.')
 add_arg('--layers',         default=['4_1'], nargs='+', type=str, help='The layer with which to match content.')
 add_arg('--shapes',         default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
 add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=3.0, type=float,       help='Global weight of semantics vs. features.')
-add_arg('--output',         default='output.png', type=str,       help='Output image path to save once done.')
+add_arg('--output',         default='output.png', type=str, help='Filename or path to save output once done.')
 add_arg('--output-size',    default=None, type=str,         help='Size of the output image, e.g. 512x512.')
 add_arg('--iterations',     default=3, type=int,            help='Number of iterations to run at each resolution.')
 add_arg('--phases',         default=2, type=int,            help='Number of image scales to process in phases.')
 add_arg('--slices',         default=2, type=int,            help='Split patches up into this number of batches.')
-add_arg('--cache',          default=0, type=int,            help='Whether to compute matches only once.')
 add_arg('--seed',           default='content', type=str,    help='Seed image path, "noise" or "content".')
 add_arg('--seed-range',     default='16:240', type=str,     help='Random colors chosen in range, e.g. 0:255.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
@@ -119,7 +118,7 @@ class Model(object):
         net, self.channels = {}, {}
 
         net['map'] = InputLayer((1, 1, None, None))
-        for j in range(4):
+        for j in range(5):
             net['map%i'%(j+1)] = PoolLayer(net['map'], 2**j, mode='average_exc_pad')
 
 
@@ -151,10 +150,18 @@ class Model(object):
         net['enc3_3'] = ConvLayer(net['enc3_2'], 128, 3, pad=1, **custom)
         net['enc3_4'] = ConvLayer(net['enc3_3'], 128, 3, pad=1, **custom)
         net['enc4_1'] = ConvLayer(net['enc3_4'], 256, 2, pad=0, stride=(2,2), **custom)
+        net['enc4_2'] = ConvLayer(net['enc4_1'], 256, 3, pad=1, **custom)
+        net['enc4_3'] = ConvLayer(net['enc4_2'], 256, 3, pad=1, **custom)
+        net['enc4_4'] = ConvLayer(net['enc4_3'], 256, 3, pad=1, **custom)
+        net['enc5_1'] = ConvLayer(net['enc4_4'], 512, 2, pad=0, stride=(2,2), **custom)
 
         # Decoder part of the neural network, takes abstract patterns and converts them into an image!
         self.tensor_latent = []
-        net['dec4_1'] = DecvLayer('4_1', net['enc4_1'], 128)
+        net['dec5_1'] = DecvLayer('5_1', net['enc5_1'], 256)
+        net['dec4_4'] = DecvLayer('4_4', net['dec5_1'], 256)
+        net['dec4_3'] = DecvLayer('4_3', net['dec4_4'], 256)
+        net['dec4_2'] = DecvLayer('4_2', net['dec4_3'], 256)
+        net['dec4_1'] = DecvLayer('4_1', net['dec4_2'], 128)
         net['dec3_4'] = DecvLayer('3_4', net['dec4_1'], 128)
         net['dec3_3'] = DecvLayer('3_3', net['dec3_4'], 128)
         net['dec3_2'] = DecvLayer('3_2', net['dec3_3'], 128)
@@ -169,7 +176,7 @@ class Model(object):
         net['out'+l]  = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
-        for j, i in itertools.product(range(4), range(3)):
+        for j, i in itertools.product(range(5), range(4)):
             suffix = '%i_%i' % (j+1, i+1)
             if 'enc'+suffix not in net: continue
 
@@ -244,7 +251,6 @@ class NeuralGenerator(object):
         """Constructor sets up global variables, loads and validates files, then builds the model.
         """
         self.start_time = time.time()
-        self.style_cache = {}
 
         # Prepare file output and load files specified as input.
         if args.save_every is not None:
@@ -346,7 +352,7 @@ class NeuralGenerator(object):
     def rescale_image(self, img, scale):
         """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
         """
-        def snap(value, grid=2**(int(args.layers[0][0])-1)): return int(grid * math.floor(value / grid))
+        def snap(value, grid=2**int(args.layers[0][0])): return int(grid * math.floor(value / grid))
         output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
         output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
         return np.asarray(output)
@@ -440,7 +446,7 @@ class NeuralGenerator(object):
         # Compute the score of each patch, taking into account statistics from previous iteration. This equalizes
         # the chances of the patches being selected when the user requests more variety.
         offset = self.matcher_history[layer].reshape((-1, 1))
-        scores = dist - offset * args.variety
+        scores = dist - offset
         # Pick the best style patches for each patch in the current image, the result is an array of indices.
         # Also return the maximum value along both axis, used to compare slices and add patch variety.
         return [scores.argmax(axis=0), scores.max(axis=0), dist.max(axis=1)]
@@ -511,10 +517,7 @@ class NeuralGenerator(object):
             excerpt = indices[index:index + batch_size]
             yield excerpt, [a[excerpt] for a in arrays]
 
-    def evaluate_slices(self, f, l):
-        if args.cache and l in self.style_cache:
-            return self.style_cache[l]
-
+    def evaluate_slices(self, f, l, v):
         layer, data = self.model.network['nn'+l], self.style_data[l]
         history = data[-1]
 
@@ -532,10 +535,8 @@ class NeuralGenerator(object):
                 best_idx[i] = idx[cur_idx[i]]
                 best_val[i] = cur_val[i]
 
-            history[idx] = cur_match
+            history[idx] = cur_match * v
 
-        if args.cache:
-            self.style_cache[l] = best_idx
         return best_idx, best_val
 
     def evaluate(self, Xn):
@@ -543,7 +544,7 @@ class NeuralGenerator(object):
         """
 
         if args.print_every and self.frame % args.print_every == 0:
-            print('{:>3}   {}layer{}'.format(self.frame, ansi.BOLD, ansi.ENDC), end='', flush=True)
+            print('{:>3}   {}patches{}'.format(self.frame, ansi.BOLD, ansi.ENDC), end='', flush=True)
 
         # Adjust the representation to be compatible with the model before computing results.
         current_img = Xn.reshape(self.content_img.shape).astype(np.float32) / 127.5 - 1.0
@@ -552,21 +553,21 @@ class NeuralGenerator(object):
         # Iterate through each of the style layers one by one, computing best matches.
         desired_feature = current_features[0]
 
-        for l, balance, current_feature, compute in zip(args.layers, args.balance, current_features, self.compute_output):
+        for l, balance, variety, current_feature, compute in zip(args.layers, args.balance, args.variety, current_features, self.compute_output):
             f = np.copy(desired_feature)
             self.normalize_components(l, f, self.compute_norms(np, l, f))
             self.matcher_tensors[l].set_value(f)
 
             # Compute best matching patches this style layer, going through all slices.
-            warmup = bool(self.iteration == 0 and args.variety > 0.0)
+            warmup = bool(self.iteration == 0 and variety > 0.0)
             for _ in range(2 if warmup else 1):
-                best_idx, best_val = self.evaluate_slices(f, l)
+                best_idx, best_val = self.evaluate_slices(f, l, variety)
 
             patches = self.style_data[l][0]
-            using = 100.0 * len(set(best_idx)) / best_idx.shape[0]
-            dupes = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
+            used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
+            dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
             self.error = best_val.mean()
-            print(' {}{}{} patches {:2.0f}% dupes {:2.0f}% '.format(ansi.BOLD, l, ansi.ENDC, using, dupes), end='', flush=True)
+            print(' {}{}{} used {:2.0f}% dups {:2.0f}% '.format(ansi.BOLD, l, ansi.ENDC, used, dups), end='', flush=True)
             current_best = patches[best_idx].astype(np.float32)
 
             channels = self.model.channels[l]
