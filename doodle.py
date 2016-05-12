@@ -118,13 +118,13 @@ class Model(object):
         net, self.channels = {}, {}
 
         net['map'] = InputLayer((1, 1, None, None))
-        for j in range(5):
+        for j in range(6):
             net['map%i'%(j+1)] = PoolLayer(net['map'], 2**j, mode='average_exc_pad')
 
 
         def DecvLayer(copy, previous, channels, **params):
             # Dynamically injects intermediate pitstop layers in the encoder based on what the user
-            # specified as layers. It's rather inelegant... Needs a rework! 
+            # specified as layers. It's rather inelegant... Needs a rework!
             if copy in args.layers:
                 if len(self.tensor_latent) > 0:
                     l = self.tensor_latent[-1][0]
@@ -154,10 +154,18 @@ class Model(object):
         net['enc4_3'] = ConvLayer(net['enc4_2'], 256, 3, pad=1, **custom)
         net['enc4_4'] = ConvLayer(net['enc4_3'], 256, 3, pad=1, **custom)
         net['enc5_1'] = ConvLayer(net['enc4_4'], 512, 2, pad=0, stride=(2,2), **custom)
+        net['enc5_2'] = ConvLayer(net['enc5_1'], 512, 3, pad=1, **custom)
+        net['enc5_3'] = ConvLayer(net['enc5_2'], 512, 3, pad=1, **custom)
+        net['enc5_4'] = ConvLayer(net['enc5_3'], 512, 3, pad=1, **custom)
+        net['enc6_1'] = ConvLayer(net['enc5_4'], 768, 2, pad=0, stride=(2,2), **custom)
 
         # Decoder part of the neural network, takes abstract patterns and converts them into an image!
         self.tensor_latent = []
-        net['dec5_1'] = DecvLayer('5_1', net['enc5_1'], 256)
+        net['dec6_1'] = DecvLayer('6_1', net['enc6_1'], 512)
+        net['dec5_4'] = DecvLayer('5_4', net['dec6_1'], 512)
+        net['dec5_3'] = DecvLayer('5_3', net['dec5_4'], 512)
+        net['dec5_2'] = DecvLayer('5_2', net['dec5_3'], 512)
+        net['dec5_1'] = DecvLayer('5_1', net['dec5_2'], 256)
         net['dec4_4'] = DecvLayer('4_4', net['dec5_1'], 256)
         net['dec4_3'] = DecvLayer('4_3', net['dec4_4'], 256)
         net['dec4_2'] = DecvLayer('4_2', net['dec4_3'], 256)
@@ -176,11 +184,11 @@ class Model(object):
         net['out'+l]  = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
-        for j, i in itertools.product(range(5), range(4)):
+        for j, i in itertools.product(range(6), range(4)):
             suffix = '%i_%i' % (j+1, i+1)
             if 'enc'+suffix not in net: continue
 
-            self.channels[suffix] = net['enc'+suffix].num_filters            
+            self.channels[suffix] = net['enc'+suffix].num_filters
             if args.semantic_weight > 0.0:
                 net['sem'+suffix] = ConcatLayer([net['enc'+suffix], net['map%i'%(j+1)]])
             else:
