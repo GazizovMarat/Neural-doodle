@@ -29,19 +29,16 @@ add_arg('--style',          default=None, type=str,         help='Texture image 
 add_arg('--balance',        default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
 add_arg('--variety',        default=[0.0], nargs='+', type=float, help='Bias toward selecting diverse patches, e.g. 0.5.')
 add_arg('--layers',         default=['4_1'], nargs='+', type=str, help='The layer with which to match content.')
+add_arg('--iterations',     default=[2], nargs='+', type=int,       help='Number of iterations to run at each resolution.')
 add_arg('--shapes',         default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
 add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=3.0, type=float,       help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str, help='Filename or path to save output once done.')
 add_arg('--output-size',    default=None, type=str,         help='Size of the output image, e.g. 512x512.')
-add_arg('--iterations',     default=3, type=int,            help='Number of iterations to run at each resolution.')
-add_arg('--phases',         default=2, type=int,            help='Number of image scales to process in phases.')
 add_arg('--slices',         default=2, type=int,            help='Split patches up into this number of batches.')
 add_arg('--seed',           default='content', type=str,    help='Seed image path, "noise" or "content".')
 add_arg('--seed-range',     default='16:240', type=str,     help='Random colors chosen in range, e.g. 0:255.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
-add_arg('--print-every',    default=1, type=int,            help='How often to log statistics to stdout.')
-add_arg('--save-every',     default=1, type=int,            help='How frequently to save PNG into `frames`.')
 args = parser.parse_args()
 
 
@@ -264,8 +261,6 @@ class NeuralGenerator(object):
         self.start_time = time.time()
 
         # Prepare file output and load files specified as input.
-        if args.save_every is not None:
-            os.makedirs('frames', exist_ok=True)
         if args.output is not None and os.path.isfile(args.output):
             os.remove(args.output)
 
@@ -556,9 +551,7 @@ class NeuralGenerator(object):
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
-
-        if args.print_every and self.frame % args.print_every == 0:
-            print('{:>3}   {}patches{}'.format(self.frame, ansi.BOLD, ansi.ENDC), end='', flush=True)
+        frame = 0
 
         # Adjust the representation to be compatible with the model before computing results.
         current_img = Xn.reshape(self.content_img.shape).astype(np.float32) / 127.5 - 1.0
@@ -567,119 +560,88 @@ class NeuralGenerator(object):
         # Iterate through each of the style layers one by one, computing best matches.
         desired_feature = current_features[0]
 
-        for l, balance, variety, current_feature, compute in zip(args.layers, args.balance, args.variety, current_features, self.compute_output):
+        for l, iterations, balance, variety, current_feature, compute in\
+                zip(args.layers, args.iterations, args.balance, args.variety, current_features, self.compute_output):
+
+            print('{}patches {}{}'.format(ansi.BOLD, l, ansi.ENDC))
+
+            self.iter_time = time.time()
             channels = self.model.channels[l]
             f = np.copy(desired_feature)
 
-            for j in range(2):
+            for j in range(iterations):
                 self.normalize_components(l, f, self.compute_norms(np, l, f))
                 self.matcher_tensors[l].set_value(f)
 
                 # Compute best matching patches this style layer, going through all slices.
-                warmup = bool(self.iteration == 0 and variety > 0.0 and j == 0)
+                warmup = bool(j == 0 and variety > 0.0)
                 for _ in range(2 if warmup else 1):
                     best_idx, best_val = self.evaluate_slices(f, l, variety)
 
                 patches = self.style_data[l][0]
-                used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
-                dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
-                self.error = best_val.mean()
-                print(' {}{}{} used {:2.0f}% dups {:2.0f}% '.format(ansi.BOLD, l, ansi.ENDC, used, dups), end='', flush=True)
                 current_best = patches[best_idx].astype(np.float32)
 
                 better_patches = current_best.transpose((0, 2, 3, 1))
                 better_features = reconstruct_from_patches_2d(better_patches, f.shape[2:] + (f.shape[1],))
                 better_features = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
                 f = better_features
-                print('')
-                assert f.shape == desired_feature.shape
+
+
+                used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
+                dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
+                err = best_val.mean()
+                print('{:>3} used {:2.0f}% dups {:2.0f}% loss {:3.1f}'.format(frame, used, dups, err), end='')
+
+                current_time = time.time()
+                print('  {}time{} {:3.1f}s '.format(ansi.BOLD, ansi.ENDC, current_time - self.iter_time), flush=True)
+                self.iter_time = current_time
+                frame += 1
 
             f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * better_features[:,:channels]
-            print(f.shape, self.content_map.shape)
             desired_feature = compute(f, self.content_map)
-
-            if np.isnan(desired_feature).any():
-                raise OverflowError("Optimization diverged; try using a different device or parameters.")
-
-        # Dump the image to disk if requested by the user.
-        if args.save_every and self.frame % args.save_every == 0:
-            frame = Xn.reshape(self.content_img.shape[1:])
-            resolution = self.content_img_original.shape
-            image = scipy.misc.toimage(self.model.finalize_image(frame, resolution), cmin=0, cmax=255)
-            image.save('frames/%04d.png'%self.frame)
-
-        # Print more information to the console every few iterations.
-        if args.print_every and self.frame % args.print_every == 0:
-            current_time = time.time()
-            print('  {}time{} {:3.1f}s '.format(ansi.BOLD, ansi.ENDC, current_time - self.iter_time), flush=True)
-            self.iter_time = current_time
-
-        # Update counters and timers.
-        self.frame += 1
-        self.iteration += 1
 
         return desired_feature
 
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
         """
-        self.frame, Xn = 0, None
-        for i in range(args.phases):
-            self.error = 255.0
-            scale = 1.0 / 2.0 ** (args.phases - 1 - i)
+        self.frame = 0
 
-            shape = self.content_img_original.shape
-            print('\n{}Phase #{}: resolution {}x{}  scale {}{}'\
-                    .format(ansi.BLUE_B, i, int(shape[1]*scale), int(shape[0]*scale), scale, ansi.BLUE))
+        shape = self.content_img_original.shape
+        print('\n{}Resolution {}x{}{}'\
+                .format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE))
 
-            # Precompute all necessary data for the various layers, put patches in place into augmented network.
-            self.model.setup(layers=['sem'+l for l in args.layers])
-            self.prepare_content(scale)
-            self.prepare_style(scale)
+        # Precompute all necessary data for the various layers, put patches in place into augmented network.
+        self.model.setup(layers=['sem'+l for l in args.layers])
+        self.prepare_content()
+        self.prepare_style()
 
-            # Now setup the model with the new data, ready for the optimization loop.
-            self.model.setup(layers=['sem'+l for l in args.layers] + ['out'+l for l in args.layers])
-            self.prepare_optimization()
-            print('{}'.format(ansi.ENDC))
+        # Now setup the model with the new data, ready for the optimization loop.
+        self.model.setup(layers=['sem'+l for l in args.layers] + ['out'+l for l in args.layers])
+        self.prepare_optimization()
+        print('{}'.format(ansi.ENDC))
 
-            # Setup the seed for the optimization as specified by the user.
-            shape = self.content_img.shape[2:]
-            if args.seed == 'content':
-                Xn = (self.content_img[0] + 1.0) * 127.5
-            elif args.seed == 'noise':
-                bounds = [int(i) for i in args.seed_range.split(':')]
-                Xn = np.random.uniform(bounds[0], bounds[1], shape + (3,)).astype(np.float32)
-            elif args.seed == 'previous':
-                Xn = scipy.misc.imresize(Xn[0], shape, interp='bicubic')
-                Xn = Xn.transpose((2, 0, 1))[np.newaxis]
-            elif os.path.exists(args.seed):
-                seed_image = scipy.ndimage.imread(args.seed, mode='RGB')
-                seed_image = scipy.misc.imresize(seed_image, shape, interp='bicubic')
-                self.seed_image = self.model.prepare_image(seed_image)
-                Xn = (self.seed_image[0] + 1.0) * 127.5
-            if Xn is None:
-                error("Seed for optimization was not found. You can either...",
-                      "  - Set the `--seed` to `content` or `noise`.", "  - Specify `--seed` as a valid filename.")
+        # Setup the seed for the optimization as specified by the user.
+        shape = self.content_img.shape[2:]
+        if args.seed == 'content':
+            Xn = (self.content_img[0] + 1.0) * 127.5
+        elif args.seed == 'noise':
+            bounds = [int(i) for i in args.seed_range.split(':')]
+            Xn = np.random.uniform(bounds[0], bounds[1], shape + (3,)).astype(np.float32)
+        elif os.path.exists(args.seed):
+            seed_image = scipy.ndimage.imread(args.seed, mode='RGB')
+            seed_image = scipy.misc.imresize(seed_image, shape, interp='bicubic')
+            self.seed_image = self.model.prepare_image(seed_image)
+            Xn = (self.seed_image[0] + 1.0) * 127.5
+        if Xn is None:
+            error("Seed for optimization was not found. You can either...",
+                    "  - Set the `--seed` to `content` or `noise`.", "  - Specify `--seed` as a valid filename.")
 
-            # Optimization algorithm needs min and max bounds to prevent divergence.
-            data_bounds = np.zeros((np.product(Xn.shape), 2), dtype=np.float64)
-            data_bounds[:] = (0.0, 255.0)
+        Xn = self.evaluate(Xn)
+        output = self.model.finalize_image(Xn.reshape(self.content_img.shape[1:]), self.content_img_original.shape)
+        scipy.misc.toimage(output, cmin=0, cmax=255).save(args.output)
 
-            self.iter_time, self.iteration, interrupt = time.time(), 0, False
-            for _ in range(args.iterations):
-                Xn = self.evaluate(Xn)
-
-            args.seed = 'previous'
-            resolution = self.content_img.shape
-            Xn = Xn.reshape(resolution)
-
-            output = self.model.finalize_image(Xn[0], self.content_img_original.shape)
-            scipy.misc.toimage(output, cmin=0, cmax=255).save(args.output)
-
-        interrupt = False
-        status = "finished in" if not interrupt else "interrupted at"
-        print('\n{}Optimization {} {:3.1f}s, average patch error {:3.1f}!{}\n'\
-              .format(ansi.CYAN, status, time.time() - self.start_time, self.error, ansi.ENDC))
+        print('\n{}Optimization finished in {:3.1f}s!{}\n'.format(ansi.CYAN, time.time()-self.start_time,  ansi.ENDC))
 
 
 if __name__ == "__main__":
