@@ -128,7 +128,10 @@ class Model(object):
             if copy in args.layers:
                 if len(self.tensor_latent) > 0:
                     l = self.tensor_latent[-1][0]
-                    net['out'+l] = ConcatLayer([previous, net['map%i'%(int(l[0])-1)]])
+                    if args.semantic_weight > 0.0:
+                        net['out'+l] = ConcatLayer([previous, net['map%i'%(int(l[0])-1)]])
+                    else:
+                        net['out'+l] = previous
 
                 self.tensor_latent.append((copy, T.tensor4()))
                 net['lat'+copy] = InputLayer((1, previous.num_filters, None, None), var=self.tensor_latent[-1][1])
@@ -179,7 +182,7 @@ class Model(object):
         net['dec1_2'] = DecvLayer('1_2', net['dec2_1'],  32)
         net['dec1_1'] = DecvLayer('1_1', net['dec1_2'],   3, nonlinearity=lasagne.nonlinearities.tanh)
         net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec1_1'])
-        
+
         l = self.tensor_latent[-1][0]
         net['out'+l]  = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
 
@@ -294,7 +297,10 @@ class NeuralGenerator(object):
             if self.content_img_original is None and args.output_size:
                 shape = tuple([int(i) for i in args.output_size.split('x')])
             else:
-                shape = self.style_img_original.shape[:2]
+                if self.content_img_original is None:
+                    shape = self.style_img_original.shape[:2]
+                else:
+                    shape = self.content_img_original.shape[:2]
 
             self.content_map_original = np.zeros(shape+(3,))
             args.semantic_weight = 0.0
@@ -360,7 +366,7 @@ class NeuralGenerator(object):
     def rescale_image(self, img, scale):
         """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
         """
-        def snap(value, grid=2**int(args.layers[0][0])): return int(grid * math.floor(value / grid))
+        def snap(value, grid=2**(int(args.layers[0][0])-1)): return int(grid * math.floor(value / grid))
         output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
         output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
         return np.asarray(output)
@@ -562,29 +568,34 @@ class NeuralGenerator(object):
         desired_feature = current_features[0]
 
         for l, balance, variety, current_feature, compute in zip(args.layers, args.balance, args.variety, current_features, self.compute_output):
-            f = np.copy(desired_feature)
-            self.normalize_components(l, f, self.compute_norms(np, l, f))
-            self.matcher_tensors[l].set_value(f)
-
-            # Compute best matching patches this style layer, going through all slices.
-            warmup = bool(self.iteration == 0 and variety > 0.0)
-            for _ in range(2 if warmup else 1):
-                best_idx, best_val = self.evaluate_slices(f, l, variety)
-
-            patches = self.style_data[l][0]
-            used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
-            dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
-            self.error = best_val.mean()
-            print(' {}{}{} used {:2.0f}% dups {:2.0f}% '.format(ansi.BOLD, l, ansi.ENDC, used, dups), end='', flush=True)
-            current_best = patches[best_idx].astype(np.float32)
-
             channels = self.model.channels[l]
-            better_patches = current_best[:,:channels].transpose((0, 2, 3, 1))
-            better_shape = f.shape[2:] + (channels,)
-            better_features = reconstruct_from_patches_2d(better_patches, better_shape)
+            f = np.copy(desired_feature)
 
-            f = (1.0 - balance) * current_feature[:,:channels]\
-              + (0.0 + balance) * better_features.transpose((2, 0, 1))[np.newaxis] 
+            for j in range(2):
+                self.normalize_components(l, f, self.compute_norms(np, l, f))
+                self.matcher_tensors[l].set_value(f)
+
+                # Compute best matching patches this style layer, going through all slices.
+                warmup = bool(self.iteration == 0 and variety > 0.0 and j == 0)
+                for _ in range(2 if warmup else 1):
+                    best_idx, best_val = self.evaluate_slices(f, l, variety)
+
+                patches = self.style_data[l][0]
+                used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
+                dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
+                self.error = best_val.mean()
+                print(' {}{}{} used {:2.0f}% dups {:2.0f}% '.format(ansi.BOLD, l, ansi.ENDC, used, dups), end='', flush=True)
+                current_best = patches[best_idx].astype(np.float32)
+
+                better_patches = current_best.transpose((0, 2, 3, 1))
+                better_features = reconstruct_from_patches_2d(better_patches, f.shape[2:] + (f.shape[1],))
+                better_features = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
+                f = better_features
+                print('')
+                assert f.shape == desired_feature.shape
+
+            f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * better_features[:,:channels]
+            print(f.shape, self.content_map.shape)
             desired_feature = compute(f, self.content_map)
 
             if np.isnan(desired_feature).any():
