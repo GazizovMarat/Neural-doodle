@@ -43,6 +43,7 @@ add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension
 add_arg('--semantic-weight', default=3.0, type=float,       help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str, help='Filename or path to save output once done.')
 add_arg('--output-size',    default=None, type=str,         help='Size of the output image, e.g. 512x512.')
+add_arg('--frames',         default=False, action='store_true',   help='Render intermediate frames, takes more time.')
 add_arg('--slices',         default=2, type=int,            help='Split patches up into this number of batches.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
 args = parser.parse_args()
@@ -561,11 +562,13 @@ class NeuralGenerator(object):
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
-        frame = 1
+        frame = 0
         parameters = zip(args.layers, extend(args.iterations), extend(args.balance), extend(args.variety))
 
         # Iterate through each of the style layers one by one, computing best matches.
         desired_feature = np.copy(self.content_features[0])
+        self.render(frame, args.layers[0], self.content_features[0])
+
         for parameter, current_feature, compute in zip(parameters, self.content_features, self.compute_output):
             l, iterations, balance, variety = parameter
 
@@ -593,13 +596,28 @@ class NeuralGenerator(object):
                 err = best_val.mean()
                 print('{:>3}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'.format(frame, ansi.BOLD, ansi.ENDC, used, dups, ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
 
-                iter_time = time.time()
                 frame += 1
+                self.render(frame, l, desired_feature)
+                iter_time = time.time()
 
             f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * desired_feature[:,:channels]
             desired_feature = compute(f, self.content_map)
 
         return desired_feature
+
+    def render(self, frame, layer, features):
+        if not args.frames: return
+
+        found = False
+        for l, compute in zip(args.layers, self.compute_output):
+            if not found and layer != l: continue
+            found = True
+            features = compute(features[:,:self.model.channels[l]], self.content_map)
+
+        output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_img_original.shape)
+        filename = os.path.basename(args.output)
+        scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}-L{}.png'.format(filename, frame, layer[0]))
+
 
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
