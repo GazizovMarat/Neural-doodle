@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
+"""                        _       _                 _ _        
+ _ __   ___ _   _ _ __ __ _| |   __| | ___   ___   __| | | ___  
+| '_ \ / _ \ | | | '__/ _` | |  / _` |/ _ \ / _ \ / _` | |/ _ \ 
+| | | |  __/ |_| | | | (_| | | | (_| | (_) | (_) | (_| | |  __/ 
+|_| |_|\___|\__,_|_|  \__,_|_|  \__,_|\___/ \___/ \__,_|_|\___| 
+
+"""
 #
-# Neural Doodle!
 # Copyright (c) 2016, Alex J. Champandard.
+#
+# Neural Doodle is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
+# Public License version 3. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
 #
 # Research and Development sponsored by the nucl.ai Conference!
 #   http://events.nucl.ai/
@@ -15,21 +26,19 @@ import time
 import pickle
 import argparse
 import itertools
-import collections
 
 
 # Configure all options first so we can later custom-load other libraries (Theano) based on device specified by user.
 parser = argparse.ArgumentParser(description='Generate a new image by applying style onto a content image.',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 add_arg = parser.add_argument
-
 add_arg('--content',        default=None, type=str,         help='Subject image path to repaint in new style.')
 add_arg('--style',          default=None, type=str,         help='Texture image path to extract patches from.')
+add_arg('--layers',         default=['6_1','5_1','4_1'], nargs='+', type=str, help='The layers/scales to process.')
+add_arg('--variety',        default=[0.2, 0.1, 0.0], nargs='+', type=float,   help='Bias selection ofdiverse patches')
 add_arg('--balance',        default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
-add_arg('--variety',        default=[0.0], nargs='+', type=float, help='Bias toward selecting diverse patches, e.g. 0.5.')
-add_arg('--layers',         default=['4_1'], nargs='+', type=str, help='The layer with which to match content.')
-add_arg('--iterations',     default=[2], nargs='+', type=int,     help='Number of iterations to run at each resolution.')
-add_arg('--shapes',         default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
+add_arg('--iterations',     default=[6,4,2], nargs='+', type=int, help='Number of iterations to run at each resolution.')
+add_arg('--shapes',         default=[3,3,2], nargs='+', type=int, help='Size of kernels used for patch extraction.')
 add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=3.0, type=float,       help='Global weight of semantics vs. features.')
 add_arg('--output',         default='output.png', type=str, help='Filename or path to save output once done.')
@@ -41,7 +50,7 @@ args = parser.parse_args()
 
 #----------------------------------------------------------------------------------------------------------------------
 
-# Color coded output helps visualize the information a little better, plus looks cool!
+# Color coded output helps visualize the information a little better, plus it looks cool!
 class ansi:
     BOLD = '\033[1;97m'
     WHITE = '\033[0;97m'
@@ -54,21 +63,24 @@ class ansi:
     CYAN = '\033[0;36m'
     CYAN_B = '\033[1;36m'
     ENDC = '\033[0m'
-    
+
 def error(message, *lines):
     string = "\n{}ERROR: " + message + "{}\n" + "\n".join(lines) + "{}\n"
     print(string.format(ansi.RED_B, ansi.RED, ansi.ENDC))
     sys.exit(-1)
 
-print("""{}NOTICE: This is R&D in progress. Terms and Conditions:{}
-  - Trained models are for non-commercial use, no redistribution.
-  - For derived/inspired research, please cite this project.\n{}""".format(ansi.YELLOW_B, ansi.YELLOW, ansi.ENDC))
+def extend(lst):
+    return itertools.chain(lst, itertools.repeat(lst[-1]))
 
-print('{}Neural Doodle for semantic style transfer.{}'.format(ansi.CYAN_B, ansi.ENDC))
+print("""{}NOTICE: This R&D branch is in progress. Terms and Conditions:{}
+  - Trained models are for non-commercial use, no redistribution.
+  - For derived/inspired research, please cite this project.{}""".format(ansi.YELLOW_B, ansi.YELLOW, ansi.ENDC))
+
+print('{}    {}High-quality image synthesis powered by Deep Learning!{}'.format(ansi.CYAN_B, __doc__, ansi.ENDC))
 
 # Load the underlying deep learning libraries based on the device specified.  If you specify THEANO_FLAGS manually,
 # the code assumes you know what you are doing and they are not overriden!
-os.environ.setdefault('THEANO_FLAGS', 'floatX=float32,device={},force_device=True,'\
+os.environ.setdefault('THEANO_FLAGS', 'floatX=float32,device={},force_device=True,allow_gc=True,'\
                                       'print_active_device=False'.format(args.device))
 
 # Scientific & Imaging Libraries
@@ -91,7 +103,7 @@ import lasagne
 from lasagne.layers import Conv2DLayer as ConvLayer, Deconv2DLayer as DeconvLayer, Pool2DLayer as PoolLayer
 from lasagne.layers import InputLayer, ConcatLayer
 
-print('{}  - Using device `{}` for processing the images.{}'.format(ansi.CYAN, theano.config.device, ansi.ENDC))
+print('{}  - Using the device `{}` for heavy computation.{}'.format(ansi.CYAN, theano.config.device, ansi.ENDC))
 
 
 #----------------------------------------------------------------------------------------------------------------------
@@ -201,7 +213,7 @@ class Model(object):
         """
         data_file = os.path.join(os.path.dirname(__file__), 'gelu2_conv.pkl')
         if not os.path.exists(data_file):
-            error("Model file with pre-trained convolution layers not found. Download here and extract...",
+            error("Model file with pre-trained convolution layers not found. Download here and unzip...",
                   "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu2_conv.pkl.bz2")
 
         data = pickle.load(open(data_file, 'rb'))
@@ -391,7 +403,7 @@ class NeuralGenerator(object):
         self.style_map = style_map.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
 
         # Compile a function to run on the GPU to extract patches for all layers at once.
-        layer_patches = self.do_extract_patches(args.layers, self.model.get_outputs('sem', args.layers), args.shapes)
+        layer_patches = self.do_extract_patches(args.layers, self.model.get_outputs('sem', args.layers), extend(args.shapes))
         extractor = self.compile([self.model.tensor_img, self.model.tensor_map], layer_patches)
         result = extractor(self.style_img, self.style_map)
 
@@ -416,10 +428,9 @@ class NeuralGenerator(object):
         self.matcher_inputs = {self.model.network['dup'+l]: self.matcher_tensors[l] for l in args.layers}
         nn_layers = [self.model.network['nn'+l] for l in args.layers]
         self.matcher_outputs = dict(zip(args.layers, lasagne.layers.get_output(nn_layers, self.matcher_inputs)))
+        self.compute_matches = {l: self.compile([self.matcher_history[l]], self.do_match_patches(l)) for l in args.layers}
 
-        self.compute_matches = {l: self.compile([self.matcher_history[l]], self.do_match_patches(l))\
-                                                for l in args.layers}
-
+        # Decoding intermediate features into more specialized features and all the way to the output image.
         self.compute_output = []
         for layer, (_, tensor_latent) in zip(args.layers, self.model.tensor_latent):
             output = lasagne.layers.get_output(self.model.network['out'+layer],
@@ -470,7 +481,6 @@ class NeuralGenerator(object):
         """Return a list of Theano expressions for the error function, measuring how different the current image is
         from the reference content that was loaded.
         """
-
         content_loss = []
         if args.content_weight == 0.0:
             return content_loss
@@ -544,7 +554,6 @@ class NeuralGenerator(object):
                 i = np.where(cur_val > best_val)
                 best_idx[i] = idx[cur_idx[i]]
                 best_val[i] = cur_val[i]
-
             history[idx] = cur_match * v
 
         return best_idx, best_val
@@ -552,43 +561,42 @@ class NeuralGenerator(object):
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
-        frame = 0
+        frame = 1
+        parameters = zip(args.layers, extend(args.iterations), extend(args.balance), extend(args.variety))
 
         # Iterate through each of the style layers one by one, computing best matches.
-        desired_feature = self.content_features[0]
-        for l, iterations, balance, variety, current_feature, compute in\
-                zip(args.layers, args.iterations, args.balance, args.variety, self.content_features, self.compute_output):
+        desired_feature = np.copy(self.content_features[0])
+        for parameter, current_feature, compute in zip(parameters, self.content_features, self.compute_output):
+            l, iterations, balance, variety = parameter
 
-            iter_time = time.time()
-            channels = self.model.channels[l]
-            f = np.copy(desired_feature)
-
-            print('\n{}Phase {}{}: variety {}  balance {}{}'.format(ansi.CYAN_B, l, ansi.CYAN, variety, balance, ansi.ENDC))
+            print('\n{}Phase {}{}: variety {}, balance {}, iterations {}.{}'\
+                 .format(ansi.CYAN_B, l, ansi.CYAN, variety, balance, iterations, ansi.ENDC))
+            channels, iter_time = self.model.channels[l], time.time()
 
             for j in range(iterations):
-                self.normalize_components(l, f, self.compute_norms(np, l, f))
-                self.matcher_tensors[l].set_value(f)
+                self.normalize_components(l, desired_feature, self.compute_norms(np, l, desired_feature))
+                self.matcher_tensors[l].set_value(desired_feature)
 
                 # Compute best matching patches this style layer, going through all slices.
-                best_idx, best_val = self.evaluate_slices(f, l, variety)
+                best_idx, best_val = self.evaluate_slices(desired_feature, l, variety)
 
                 patches = self.style_data[l][0]
                 current_best = patches[best_idx].astype(np.float32)
 
                 better_patches = current_best.transpose((0, 2, 3, 1))
-                better_features = reconstruct_from_patches_2d(better_patches, f.shape[2:] + (f.shape[1],))
-                better_features = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
-                f = better_features
+                better_shape = desired_feature.shape[2:] + (desired_feature.shape[1],)
+                better_features = reconstruct_from_patches_2d(better_patches, better_shape)
+                desired_feature = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
-                used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
-                dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
+                used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
+                dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
                 err = best_val.mean()
-                print('{:>3}   {}patches{} used {:2.0f}% dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'.format(frame, ansi.BOLD, ansi.ENDC, used, dups, ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
+                print('{:>3}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'.format(frame, ansi.BOLD, ansi.ENDC, used, dups, ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
 
                 iter_time = time.time()
                 frame += 1
 
-            f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * better_features[:,:channels]
+            f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * desired_feature[:,:channels]
             desired_feature = compute(f, self.content_map)
 
         return desired_feature
@@ -596,17 +604,15 @@ class NeuralGenerator(object):
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
         """
-        self.frame = 0
-
+        # Precompute all features from the content image based on layers specified.
         shape = self.content_img_original.shape
-        print('\n{}Content {}x{}{}'.format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE))
-
-        # Precompute all necessary data for the various layers, put patches in place into augmented network.
+        print('\n{}Content {}x{}{} at scale {:3.1f}'.format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE, 1.0))
         self.model.setup(layers=['sem'+l for l in args.layers])
         self.prepare_content()
 
+        # Extract style patches from the texture image as specified by the user.
         shape = self.style_img_original.shape
-        print('\n{}Style {}x{}{}'.format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE))
+        print('\n{}Style {}x{}{} at scale {:3.1f}'.format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE, 1.0))
         self.prepare_style()
 
         # Now setup the model with the new data, ready for the optimization loop.
