@@ -213,8 +213,8 @@ class Model(object):
         """
         data_file = os.path.join(os.path.dirname(__file__), 'gelu2_conv.pkl')
         if not os.path.exists(data_file):
-            error("Model file with pre-trained convolution layers not found. Download here and unzip...",
-                  "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu2_conv.pkl.bz2")
+            error("Model file with pre-trained convolution layers not found. Download from here...",
+                  "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu2_conv.pkl")
 
         data = pickle.load(open(data_file, 'rb'))
         for layer, values in data.items():
