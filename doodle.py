@@ -10,7 +10,6 @@
 
 import os
 import sys
-import bz2
 import math
 import time
 import pickle
@@ -202,18 +201,18 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        data_file = os.path.join(os.path.dirname(__file__), 'gelu2_conv.pkl.bz2')
+        data_file = os.path.join(os.path.dirname(__file__), 'gelu2_conv.pkl')
         if not os.path.exists(data_file):
-            error("Model file with pre-trained convolution layers not found. Download here...",
+            error("Model file with pre-trained convolution layers not found. Download here and extract...",
                   "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu2_conv.pkl.bz2")
 
-        data = pickle.load(bz2.open(data_file, 'rb'))
+        data = pickle.load(open(data_file, 'rb'))
         for layer, values in data.items():
             assert layer in self.network, "Layer `{}` not found as expected.".format(layer)
             for p, v in zip(self.network[layer].get_params(), values):
                 assert p.get_value().shape == v.shape, "Layer `{}` in network has size {} but data is {}."\
                                                        .format(layer, v.shape, p.get_value().shape)
-                p.set_value(v)
+                p.set_value(v.astype(np.float32))
 
     def setup(self, layers):
         """Setup the inputs and outputs, knowing the layers that are required by the optimization algorithm.
@@ -552,10 +551,13 @@ class NeuralGenerator(object):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
         frame = 0
+        iter_time = time.time()
 
         # Adjust the representation to be compatible with the model before computing results.
         current_img = Xn.reshape(self.content_img.shape).astype(np.float32) / 127.5 - 1.0
         current_features = self.compute_features(current_img, self.content_map)
+
+        print('{}seed{} {:3.1f}s'.format(ansi.BOLD, ansi.ENDC, time.time() - iter_time))
 
         # Iterate through each of the style layers one by one, computing best matches.
         desired_feature = current_features[0]
@@ -563,20 +565,19 @@ class NeuralGenerator(object):
         for l, iterations, balance, variety, current_feature, compute in\
                 zip(args.layers, args.iterations, args.balance, args.variety, current_features, self.compute_output):
 
-            print('{}patches {}{}'.format(ansi.BOLD, l, ansi.ENDC))
+            iter_time = time.time()
 
-            self.iter_time = time.time()
             channels = self.model.channels[l]
             f = np.copy(desired_feature)
+
+            print('{}patches {}{}'.format(ansi.BOLD, l, ansi.ENDC))
 
             for j in range(iterations):
                 self.normalize_components(l, f, self.compute_norms(np, l, f))
                 self.matcher_tensors[l].set_value(f)
 
                 # Compute best matching patches this style layer, going through all slices.
-                warmup = bool(j == 0 and variety > 0.0)
-                for _ in range(2 if warmup else 1):
-                    best_idx, best_val = self.evaluate_slices(f, l, variety)
+                best_idx, best_val = self.evaluate_slices(f, l, variety)
 
                 patches = self.style_data[l][0]
                 current_best = patches[best_idx].astype(np.float32)
@@ -586,15 +587,13 @@ class NeuralGenerator(object):
                 better_features = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
                 f = better_features
 
-
                 used = 100.0 * len(set(best_idx)) / best_idx.shape[0]
                 dups = 100.0 * len([v for v in collections.Counter(best_idx).values() if v>1]) / best_idx.shape[0]
-                err = best_val.mean()
-                print('{:>3} used {:2.0f}% dups {:2.0f}% loss {:3.1f}'.format(frame, used, dups, err), end='')
+                err = 100.0 * best_val.mean()
+                print('{:>3} used {:2.0f}% dups {:2.0f}%  match {:3.2e}'.format(frame, used, dups, err), end='')
 
-                current_time = time.time()
-                print('  {}time{} {:3.1f}s '.format(ansi.BOLD, ansi.ENDC, current_time - self.iter_time), flush=True)
-                self.iter_time = current_time
+                print('  {}time{} {:3.1f}s '.format(ansi.BOLD, ansi.ENDC, time.time() - iter_time), flush=True)
+                iter_time = time.time()
                 frame += 1
 
             f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * better_features[:,:channels]
