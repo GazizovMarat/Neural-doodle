@@ -32,20 +32,20 @@ import itertools
 parser = argparse.ArgumentParser(description='Generate a new image by applying style onto a content image.',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 add_arg = parser.add_argument
-add_arg('--content',        default=None, type=str,         help='Subject image path to repaint in new style.')
-add_arg('--style',          default=None, type=str,         help='Texture image path to extract patches from.')
-add_arg('--layers',         default=['6_1','5_1','4_1'], nargs='+', type=str, help='The layers/scales to process.')
-add_arg('--variety',        default=[0.2, 0.1, 0.0], nargs='+', type=float,   help='Bias selection ofdiverse patches')
-add_arg('--balance',        default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
-add_arg('--iterations',     default=[6,4,2], nargs='+', type=int, help='Number of iterations to run at each resolution.')
-add_arg('--shapes',         default=[3,3,2], nargs='+', type=int, help='Size of kernels used for patch extraction.')
-add_arg('--semantic-ext',   default='_sem.png', type=str,   help='File extension for the semantic maps.')
-add_arg('--semantic-weight', default=3.0, type=float,       help='Global weight of semantics vs. features.')
-add_arg('--output',         default='output.png', type=str, help='Filename or path to save output once done.')
-add_arg('--output-size',    default=None, type=str,         help='Size of the output image, e.g. 512x512.')
-add_arg('--frames',         default=False, action='store_true',   help='Render intermediate frames, takes more time.')
-add_arg('--slices',         default=2, type=int,            help='Split patches up into this number of batches.')
-add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
+add_arg('--content',         default=None, type=str,         help='Subject image path to repaint in new style.')
+add_arg('--style',           default=None, type=str,         help='Texture image path to extract patches from.')
+add_arg('--layers',          default=['6_1','5_1','4_1'], nargs='+', type=str, help='The layers/scales to process.')
+add_arg('--variety',         default=[0.2, 0.1, 0.0], nargs='+', type=float,   help='Bias selecting diverse patches')
+add_arg('--balance',         default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
+add_arg('--iterations',      default=[6,4,2], nargs='+', type=int, help='Number of iterations to run in each phase.')
+add_arg('--shapes',          default=[3,3,2], nargs='+', type=int, help='Size of kernels used for patch extraction.')
+add_arg('--semantic-ext',    default='_sem.png', type=str,   help='File extension for the semantic maps.')
+add_arg('--semantic-weight', default=3.0, type=float,        help='Global weight of semantics vs. style features.')
+add_arg('--output',          default='output.png', type=str, help='Filename or path to save output once done.')
+add_arg('--output-size',     default=None, type=str,         help='Size of the output image, e.g. 512x512.')
+add_arg('--frames',          default=False, action='store_true',   help='Render intermediate frames, takes more time.')
+add_arg('--slices',          default=2, type=int,            help='Split patches up into this number of batches.')
+add_arg('--device',          default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
 args = parser.parse_args()
 
 
@@ -70,8 +70,8 @@ def error(message, *lines):
     print(string.format(ansi.RED_B, ansi.RED, ansi.ENDC))
     sys.exit(-1)
 
-def extend(lst):
-    return itertools.chain(lst, itertools.repeat(lst[-1]))
+def extend(lst): return itertools.chain(lst, itertools.repeat(lst[-1]))
+def snap(value, grid=2**(int(args.layers[0][0])-1)): return int(grid * math.floor(value / grid))
 
 print("""{}NOTICE: This R&D branch is in progress. Terms and Conditions:{}
   - Trained models are for non-commercial use, no redistribution.
@@ -128,9 +128,8 @@ class Model(object):
         for j in range(6):
             net['map%i'%(j+1)] = PoolLayer(net['map'], 2**j, mode='average_exc_pad')
 
-
         def DecvLayer(copy, previous, channels, **params):
-            # Dynamically injects intermediate pitstop layers in the encoder based on what the user
+            # Dynamically injects intermediate "pitstop" output layers in the decoder based on what the user
             # specified as layers. It's rather inelegant... Needs a rework!
             if copy in args.layers:
                 if len(self.tensor_latent) > 0:
@@ -240,17 +239,15 @@ class Model(object):
         return [self.tensor_outputs[type+l] for l in layers]
 
     def prepare_image(self, image):
-        """Given an image loaded from disk, turn it into a representation compatible with the model.
-        The format is (b,c,y,x) with batch=1 for a single image, channels=3 for RGB, and y,x matching
-        the resolution.
+        """Given an image loaded from disk, turn it into a representation compatible with the model. The format is
+        (b,c,y,x) with batch=1 for a single image, channels=3 for RGB, and y,x matching the resolution.
         """
         image = np.swapaxes(np.swapaxes(image, 1, 2), 0, 1)[::-1, :, :]
         image = image.astype(np.float32) / 127.5 - 1.0
         return image[np.newaxis]
 
     def finalize_image(self, image, resolution):
-        """Based on the output of the neural network, convert it into an image format that can be saved
-        to disk -- shuffling dimensions as appropriate.
+        """Convert network output into an image format that can be saved to disk, shuffling dimensions as appropriate.
         """
         image = np.swapaxes(np.swapaxes(image[::-1], 0, 1), 1, 2)
         image = np.clip(image, 0, 255).astype('uint8')
@@ -371,7 +368,6 @@ class NeuralGenerator(object):
     def rescale_image(self, img, scale):
         """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
         """
-        def snap(value, grid=2**(int(args.layers[0][0])-1)): return int(grid * math.floor(value / grid))
         output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
         output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
         return np.asarray(output)
@@ -381,7 +377,6 @@ class NeuralGenerator(object):
         """
         content_img = self.rescale_image(self.content_img_original, scale)
         self.content_img = self.model.prepare_image(content_img)
-
         content_map = self.rescale_image(self.content_map_original, scale)
         self.content_map = content_map.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
 
@@ -399,7 +394,6 @@ class NeuralGenerator(object):
         """
         style_img = self.rescale_image(self.style_img_original, scale)
         self.style_img = self.model.prepare_image(style_img)
-
         style_map = self.rescale_image(self.style_map_original, scale)
         self.style_map = style_map.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
 
@@ -422,7 +416,6 @@ class NeuralGenerator(object):
         """Optimization requires a function to compute the error (aka. loss) which is done in multiple components.
         Here we compile a function to run on the GPU that returns all components separately.
         """
-
         # Patch matching calculation that uses only pre-calculated features and a slice of the patches.
         self.matcher_tensors = {l: lasagne.utils.shared_empty(dim=4) for l in args.layers}
         self.matcher_history = {l: T.vector() for l in args.layers}
@@ -606,12 +599,10 @@ class NeuralGenerator(object):
         return desired_feature
 
     def render(self, frame, layer, features):
+        """Decode features at a specific layer and save the result to disk for visualization. (Takes 50% more time.) 
+        """
         if not args.frames: return
-
-        found = False
-        for l, compute in zip(args.layers, self.compute_output):
-            if not found and layer != l: continue
-            found = True
+        for l, compute in list(zip(args.layers, self.compute_output))[args.layers.index(layer):]:
             features = compute(features[:,:self.model.channels[l]], self.content_map)
 
         output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_img_original.shape)
