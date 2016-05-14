@@ -73,11 +73,8 @@ def error(message, *lines):
 def extend(lst): return itertools.chain(lst, itertools.repeat(lst[-1]))
 def snap(value, grid=2**(int(args.layers[0][0])-1)): return int(grid * math.floor(value / grid))
 
-print("""{}NOTICE: This R&D branch is in progress. Terms and Conditions:{}
-  - Trained models are for non-commercial use, no redistribution.
-  - For derived/inspired research, please cite this project.{}""".format(ansi.YELLOW_B, ansi.YELLOW, ansi.ENDC))
-
-print('{}    {}High-quality image synthesis powered by Deep Learning!{}'.format(ansi.CYAN_B, __doc__, ansi.ENDC))
+print("""{}    {}High-quality image synthesis powered by Deep Learning!{}
+  - Code licensed as AGPLv3, models under CC BY-NC-SA.{}""".format(ansi.CYAN_B, __doc__, ansi.CYAN, ansi.ENDC))
 
 # Load the underlying deep learning libraries based on the device specified.  If you specify THEANO_FLAGS manually,
 # the code assumes you know what you are doing and they are not overriden!
@@ -268,56 +265,10 @@ class NeuralGenerator(object):
         self.start_time = time.time()
 
         # Prepare file output and load files specified as input.
+        if args.frames is not False:
+            os.makedirs('frames', exist_ok=True)
         if args.output is not None and os.path.isfile(args.output):
             os.remove(args.output)
-
-        print(ansi.CYAN, end='')
-        target = args.content or args.output
-        self.content_img_original, self.content_map_original = self.load_images('content', target)
-        self.style_img_original, self.style_map_original = self.load_images('style', args.style)
-
-        if self.content_map_original is None and self.content_img_original is None:
-            print("  - No content files found; result depends on seed only.")
-        print(ansi.ENDC, end='')
-
-        # Display some useful errors if the user's input can't be undrestood.
-        if self.style_img_original is None:
-            error("Couldn't find style image as expected.",
-                  "  - Try making sure `{}` exists and is a valid image.".format(args.style))
-
-        if self.content_map_original is not None and self.style_map_original is None:
-            basename, _ = os.path.splitext(args.style)
-            error("Expecting a semantic map for the input style image too.",
-                  "  - Try creating the file `{}_sem.png` with your annotations.".format(basename))
-
-        if self.style_map_original is not None and self.content_map_original is None:
-            basename, _ = os.path.splitext(target)
-            error("Expecting a semantic map for the input content image too.",
-                  "  - Try creating the file `{}_sem.png` with your annotations.".format(basename))
-
-        if self.content_map_original is None:
-            if self.content_img_original is None and args.output_size:
-                shape = tuple([int(i) for i in args.output_size.split('x')])
-            else:
-                if self.content_img_original is None:
-                    shape = self.style_img_original.shape[:2]
-                else:
-                    shape = self.content_img_original.shape[:2]
-
-            self.content_map_original = np.zeros(shape+(3,))
-            args.semantic_weight = 0.0
-
-        if self.style_map_original is None:
-            self.style_map_original = np.zeros(self.style_img_original.shape[:2]+(3,))
-            args.semantic_weight = 0.0
-
-        if self.content_img_original is None:
-            self.content_img_original = np.random.uniform(0, 255, self.content_map_original.shape[:2]+(3,)).astype(np.float32)
-            args.content_weight = 0.0
-
-        if self.content_map_original.shape[2] != self.style_map_original.shape[2]:
-            error("Mismatch in number of channels for style and content semantic map.",
-                  "  - Make sure both images are RGB, RGBA, or L.")
 
         # Finalize the parameters based on what we loaded, then create the model.
         args.semantic_weight = math.sqrt(9.0 / args.semantic_weight) if args.semantic_weight else 0.0
@@ -328,7 +279,14 @@ class NeuralGenerator(object):
     # Helper Functions
     #------------------------------------------------------------------------------------------------------------------
 
-    def load_images(self, name, filename):
+    def rescale_image(self, img, scale):
+        """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
+        """
+        output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
+        output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
+        return np.asarray(output)
+
+    def load_images(self, name, filename, scale=1.0):
         """If the image and map files exist, load them. Otherwise they'll be set to default values later.
         """
         basename, _ = os.path.splitext(filename)
@@ -336,6 +294,8 @@ class NeuralGenerator(object):
         img = scipy.ndimage.imread(filename, mode='RGB') if os.path.exists(filename) else None
         map = scipy.ndimage.imread(mapname) if os.path.exists(mapname) and args.semantic_weight > 0.0 else None
 
+        shp = img.shape if img is not None else (map.shape if map is not None else '??')
+        print('\n{}{} {}x{}{} at scale {:3.1f}'.format(ansi.BLUE_B, name.capitalize(), shp[1], shp[0], ansi.BLUE, 1.0))
         if img is not None: print('  - Loading `{}` for {} data.'.format(filename, name))
         if map is not None: print('  - Adding `{}` as semantic map.'.format(mapname))
 
@@ -343,7 +303,7 @@ class NeuralGenerator(object):
             error("The {} image and its semantic map have different resolutions. Either:".format(name),
                   "  - Resize {} to {}, or\n  - Resize {} to {}."\
                   .format(filename, map.shape[1::-1], mapname, img.shape[1::-1]))
-        return img, map
+        return [(self.rescale_image(i, scale) if i is not None else None) for i in [img, map]]
 
     def compile(self, arguments, function):
         """Build a Theano function that will run the specified expression on the GPU.
@@ -353,7 +313,7 @@ class NeuralGenerator(object):
     def compute_norms(self, backend, layer, array):
         ni = backend.sqrt(backend.sum(array[:,:self.model.channels[layer]] ** 2.0, axis=(1,), keepdims=True))
         ns = backend.sqrt(backend.sum(array[:,self.model.channels[layer]:] ** 2.0, axis=(1,), keepdims=True))
-        return [ni] + [ns]
+        return [ni, ns]
 
     def normalize_components(self, layer, array, norms):
         if args.semantic_weight > 0.0:
@@ -365,37 +325,22 @@ class NeuralGenerator(object):
     # Initialization & Setup
     #------------------------------------------------------------------------------------------------------------------
 
-    def rescale_image(self, img, scale):
-        """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
-        """
-        output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
-        output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
-        return np.asarray(output)
-
-    def prepare_content(self, scale=1.0):
-        """Called each phase of the optimization, rescale the original content image and its map to use as inputs.
-        """
-        content_img = self.rescale_image(self.content_img_original, scale)
-        self.content_img = self.model.prepare_image(content_img)
-        content_map = self.rescale_image(self.content_map_original, scale)
-        self.content_map = content_map.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
-
-        # Feed-forward calculation only, returns the result of the convolution post-activation 
-        self.compute_features = self.compile([self.model.tensor_img, self.model.tensor_map],
-                                              self.model.get_outputs('sem', args.layers))
-
-        self.content_features = self.compute_features(self.content_img, self.content_map)
-        for layer, current in zip(args.layers, self.content_features):
-            print('  - Layer {} as {} array in {:,}kb.'.format(layer, current.shape[1:], current.size//1000))
-
     def prepare_style(self, scale=1.0):
         """Called each phase of the optimization, process the style image according to the scale, then run it
         through the model to extract intermediate outputs (e.g. sem4_1) and turn them into patches.
         """
-        style_img = self.rescale_image(self.style_img_original, scale)
-        self.style_img = self.model.prepare_image(style_img)
-        style_map = self.rescale_image(self.style_map_original, scale)
-        self.style_map = style_map.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
+        style_img_original, style_map_original = self.load_images('style', args.style, scale)
+
+        if style_map_original is None:
+            style_map_original = np.zeros(style_img_original.shape[:2]+(2,)) - 1.0
+            args.semantic_weight = 0.0
+
+        if style_img_original is None:
+            error("Couldn't find style image as expected.",
+                  "  - Try making sure `{}` exists and is a valid image.".format(args.style))
+
+        self.style_img = self.model.prepare_image(style_img_original)
+        self.style_map = style_map_original.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
 
         # Compile a function to run on the GPU to extract patches for all layers at once.
         layer_patches = self.do_extract_patches(args.layers, self.model.get_outputs('sem', args.layers), extend(args.shapes))
@@ -405,16 +350,61 @@ class NeuralGenerator(object):
         # Store all the style patches layer by layer, resized to match slice size and cast to 16-bit for size. 
         self.style_data = {}
         for layer, *data in zip(args.layers, result[0::3], result[1::3], result[2::3]):
-            patches = data[0]
-            l = self.model.network['nn'+layer]
+            patches, l = data[0], self.model.network['nn'+layer]
             l.num_filters = patches.shape[0] // args.slices
             self.style_data[layer] = [d[:l.num_filters*args.slices].astype(np.float16) for d in data]\
                                    + [np.zeros((patches.shape[0],), dtype=np.float16)]
             print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, patches.shape[:2], patches.shape[2:], patches.size//1000))
 
-    def prepare_optimization(self):
-        """Optimization requires a function to compute the error (aka. loss) which is done in multiple components.
-        Here we compile a function to run on the GPU that returns all components separately.
+    def prepare_content(self, scale=1.0):
+        """Called each phase of the optimization, rescale the original content image and its map to use as inputs.
+        """
+        content_img_original, content_map_original = self.load_images('content', args.content or args.output, scale)
+
+        if content_map_original is not None and self.style_map is None:
+            basename, _ = os.path.splitext(args.style)
+            error("Expecting a semantic map for the input style image too.",
+                  "  - Try creating the file `{}_sem.png` with your annotations.".format(basename))
+
+        if self.style_map.max() >= 0.0 and content_map_original is None:
+            basename, _ = 'poo', 'face' # os.path.splitext(target)
+            error("Expecting a semantic map for the input content image too.",
+                  "  - Try creating the file `{}_sem.png` with your annotations.".format(basename))
+
+        if content_map_original is None:
+            if content_img_original is None and args.output_size:
+                shape = tuple([int(i) for i in args.output_size.split('x')])
+            else:
+                if content_img_original is None:
+                    shape = self.style_img_original.shape[:2]
+                else:
+                    shape = content_img_original.shape[:2]
+
+            content_map_original = np.zeros(shape+(2,))
+            args.semantic_weight = 0.0
+
+        if content_img_original is None:
+            print("  - No content image found; seed was set to random noise.")
+            content_img_original = np.random.uniform(0, 255, content_map_original.shape[:2]+(3,)).astype(np.float32)
+
+        if content_map_original.shape[2] != self.style_map.shape[1]:
+            error("Mismatch in number of channels for style and content semantic map.",
+                  "  - Make sure both images are RGB, RGBA, or L.")
+
+        self.content_img = self.model.prepare_image(content_img_original)
+        self.content_map = content_map_original.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
+        self.content_shape = content_img_original.shape
+
+        # Feed-forward calculation only, returns the result of the convolution post-activation 
+        self.compute_features = self.compile([self.model.tensor_img, self.model.tensor_map],
+                                              self.model.get_outputs('sem', args.layers))
+
+        self.content_features = self.compute_features(self.content_img, self.content_map)
+        for layer, current in zip(args.layers, self.content_features):
+            print('  - Layer {} as {} array in {:,}kb.'.format(layer, current.shape[1:], current.size//1000))
+
+    def prepare_generation(self):
+        """Layerwise synthesis images requires two sets of Theano functions to be compiled.
         """
         # Patch matching calculation that uses only pre-calculated features and a slice of the patches.
         self.matcher_tensors = {l: lasagne.utils.shared_empty(dim=4) for l in args.layers}
@@ -465,57 +455,6 @@ class NeuralGenerator(object):
         # Pick the best style patches for each patch in the current image, the result is an array of indices.
         # Also return the maximum value along both axis, used to compare slices and add patch variety.
         return [scores.argmax(axis=0), scores.max(axis=0), dist.max(axis=1)]
-
-
-    #------------------------------------------------------------------------------------------------------------------
-    # Error/Loss Functions
-    #------------------------------------------------------------------------------------------------------------------
-
-    def content_loss(self):
-        """Return a list of Theano expressions for the error function, measuring how different the current image is
-        from the reference content that was loaded.
-        """
-        content_loss = []
-        if args.content_weight == 0.0:
-            return content_loss
-
-        # First extract all the features we need from the model, these results after convolution.
-        extractor = theano.function([self.model.tensor_img], self.model.get_outputs('enc', args.layers))
-        result = extractor(self.content_img)
-
-        # Build a list of loss components that compute the mean squared error by comparing current result to desired.
-        for l, ref in zip(args.layers, result):
-            layer = self.model.tensor_outputs['enc'+l]
-            loss = T.mean((layer - ref) ** 2.0)
-            content_loss.append(('content', l, args.content_weight * loss))
-            print('  - Content layer conv{}: {} features in {:,}kb.'.format(l, ref.shape[1], ref.size//1000))
-        return content_loss
-
-    def style_loss(self):
-        """Returns a list of loss components as Theano expressions. Finds the best style patch for each patch in the
-        current image using normalized cross-correlation, then computes the mean squared error for all patches.
-        """
-        style_loss = []
-        if args.style_weight == 0.0:
-            return style_loss
-
-        # Extract the patches from the current image, as well as their magnitude.
-        result = self.do_extract_patches(args.layers, self.model.get_outputs('enc', args.layers), args.shapes)
-
-        # Multiple style layers are optimized separately, usually conv3_1 and conv4_1 — semantic data not used here.
-        for l, matches, patches in zip(args.layers, self.tensor_matches, result[0::3]):
-            # Compute the mean squared error between the current patch and the best matching style patch.
-            # Ignore the last channels (from semantic map) so errors returned are indicative of image only.
-            loss = T.mean((patches - matches[:,:self.model.channels[l]]) ** 2.0)
-            style_loss.append(('style', l, args.style_weight * loss))
-        return style_loss
-
-    def total_variation_loss(self):
-        """Return a loss component as Theano expression for the smoothness prior on the result image.
-        """
-        x = self.model.tensor_img
-        loss = (((x[:,:,:-1,:-1] - x[:,:,1:,:-1])**2 + (x[:,:,:-1,:-1] - x[:,:,:-1,1:])**2)**1.25).mean()
-        return [('smooth', 'img', args.smoothness * loss)]
 
 
     #------------------------------------------------------------------------------------------------------------------
@@ -605,32 +544,21 @@ class NeuralGenerator(object):
         for l, compute in list(zip(args.layers, self.compute_output))[args.layers.index(layer):]:
             features = compute(features[:,:self.model.channels[l]], self.content_map)
 
-        output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_img_original.shape)
+        output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_shape)
         filename = os.path.splitext(os.path.basename(args.output))[0]
         scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}-L{}.png'.format(filename, frame, layer[0]))
-
 
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
         """
-        # Precompute all features from the content image based on layers specified.
-        shape = self.content_img_original.shape
-        print('\n{}Content {}x{}{} at scale {:3.1f}'.format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE, 1.0))
-        self.model.setup(layers=['sem'+l for l in args.layers])
-        self.prepare_content()
 
-        # Extract style patches from the texture image as specified by the user.
-        shape = self.style_img_original.shape
-        print('\n{}Style {}x{}{} at scale {:3.1f}'.format(ansi.BLUE_B, shape[1], shape[0], ansi.BLUE, 1.0))
-        self.prepare_style()
-
-        # Now setup the model with the new data, ready for the optimization loop.
         self.model.setup(layers=['sem'+l for l in args.layers] + ['out'+l for l in args.layers])
-        self.prepare_optimization()
-        print('{}'.format(ansi.ENDC), end='')
+        self.prepare_style()
+        self.prepare_content()
+        self.prepare_generation()
 
         Xn = self.evaluate((self.content_img[0] + 1.0) * 127.5)
-        output = self.model.finalize_image(Xn.reshape(self.content_img.shape[1:]), self.content_img_original.shape)
+        output = self.model.finalize_image(Xn.reshape(self.content_img.shape[1:]), self.content_shape)
         scipy.misc.toimage(output, cmin=0, cmax=255).save(args.output)
 
         print('\n{}Optimization finished in {:3.1f}s!{}\n'.format(ansi.CYAN, time.time()-self.start_time,  ansi.ENDC))
