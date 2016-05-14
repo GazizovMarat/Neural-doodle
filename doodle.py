@@ -590,6 +590,7 @@ class NeuralGenerator(object):
                 better_shape = desired_feature.shape[2:] + (desired_feature.shape[1],)
                 better_features = reconstruct_from_patches_2d(better_patches, better_shape)
                 desired_feature = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
+                desired_feature = (1.0 - balance) * current_feature + (0.0 + balance) * desired_feature
 
                 used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
                 dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
@@ -600,8 +601,7 @@ class NeuralGenerator(object):
                 self.render(frame, l, desired_feature)
                 iter_time = time.time()
 
-            f = (1.0 - balance) * current_feature[:,:channels] + (0.0 + balance) * desired_feature[:,:channels]
-            desired_feature = compute(f, self.content_map)
+            desired_feature = compute(desired_feature[:,:channels], self.content_map)
 
         return desired_feature
 
@@ -615,7 +615,7 @@ class NeuralGenerator(object):
             features = compute(features[:,:self.model.channels[l]], self.content_map)
 
         output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_img_original.shape)
-        filename = os.path.basename(args.output)
+        filename = os.path.splitext(os.path.basename(args.output))[0]
         scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}-L{}.png'.format(filename, frame, layer[0]))
 
 
