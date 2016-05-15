@@ -84,7 +84,7 @@ os.environ.setdefault('THEANO_FLAGS', 'floatX=float32,device={},force_device=Tru
 # Scientific & Imaging Libraries
 import numpy as np
 import scipy.optimize, scipy.ndimage, scipy.misc
-import PIL
+import PIL.ImageOps
 from sklearn.feature_extraction.image import reconstruct_from_patches_2d
 
 # Numeric Computing (GPU)
@@ -283,8 +283,7 @@ class NeuralGenerator(object):
         """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
         """
         output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
-        output.thumbnail((snap(output.size[0]*scale), snap(output.size[1]*scale)), PIL.Image.ANTIALIAS)
-        return np.asarray(output)
+        return np.asarray(PIL.ImageOps.fit(output, [snap(dim*scale) for dim in output.size], PIL.Image.ANTIALIAS))
 
     def load_images(self, name, filename, scale=1.0):
         """If the image and map files exist, load them. Otherwise they'll be set to default values later.
