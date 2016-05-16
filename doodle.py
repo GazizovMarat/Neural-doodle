@@ -36,7 +36,9 @@ add_arg('--content',         default=None, type=str,         help='Subject image
 add_arg('--style',           default=None, type=str,         help='Texture image path to extract patches from.')
 add_arg('--layers',          default=['5_1','4_1','3_1'], nargs='+', type=str, help='The layers/scales to process.')
 add_arg('--variety',         default=[0.2, 0.1, 0.0], nargs='+', type=float,   help='Bias selecting diverse patches')
-add_arg('--balance',         default=[1.0], nargs='+', type=float, help='Weight of style relative to content.')
+add_arg('--content-weight',  default=[0.0], nargs='+', type=float, help='Weight of input content features each layer.')
+add_arg('--previous-weight', default=[0.2], nargs='+', type=float, help='Weight of previous layer features.')
+add_arg('--noise-weight',    default=[0.0], nargs='+', type=float, help='Weight of noise added into features.')
 add_arg('--iterations',      default=[6,4,2], nargs='+', type=int, help='Number of iterations to run in each phase.')
 add_arg('--shapes',          default=[3], nargs='+', type=int, help='Size of kernels used for patch extraction.')
 add_arg('--semantic-ext',    default='_sem.png', type=str,   help='File extension for the semantic maps.')
@@ -366,7 +368,7 @@ class NeuralGenerator(object):
                   "  - Try creating the file `{}_sem.png` with your annotations.".format(basename))
 
         if self.style_map.max() >= 0.0 and content_map_original is None:
-            basename, _ = 'poo', 'face' # os.path.splitext(target)
+            basename, _ = os.path.splitext(args.content or args.output)
             error("Expecting a semantic map for the input content image too.",
                   "  - Try creating the file `{}_sem.png` with your annotations.".format(basename))
 
@@ -470,6 +472,9 @@ class NeuralGenerator(object):
             yield excerpt, [a[excerpt] for a in arrays]
 
     def evaluate_slices(self, f, l, v):
+        self.normalize_components(l, f, self.compute_norms(np, l, f))
+        self.matcher_tensors[l].set_value(f)
+
         layer, data = self.model.network['nn'+l], self.style_data[l]
         history = data[-1]
 
@@ -494,34 +499,37 @@ class NeuralGenerator(object):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
         frame = 0
-        parameters = zip(args.layers, extend(args.iterations), extend(args.balance), extend(args.variety))
+        layer_params = [args.iterations, args.content_weight, args.previous_weight, args.noise_weight, args.variety]
+        parameters = zip(args.layers, *[extend(a) for a in layer_params])
 
         # Iterate through each of the style layers one by one, computing best matches.
-        desired_feature = np.copy(self.content_features[0])
+        previous_feature = self.content_features[0]
         self.render(frame, args.layers[0], self.content_features[0])
 
-        for parameter, current_feature, compute in zip(parameters, self.content_features, self.compute_output):
-            l, iterations, balance, variety = parameter
+        for parameter, content_feature, compute in zip(parameters, self.content_features, self.compute_output):
+            l, iterations, content_weight, previous_weight, noise_weight, variety = parameter
+            desired_feature, patches = np.copy(previous_feature), self.style_data[l][0]
+            assert previous_weight + content_weight < 1.0, "Previous and content weight should total below 1.0!"
 
-            print('\n{}Phase {}{}: variety {}, balance {}, iterations {}.{}'\
-                 .format(ansi.CYAN_B, l, ansi.CYAN, variety, balance, iterations, ansi.ENDC))
+            weights = 'c={:0.1f} p={:0.1f} n={:0.1f}'.format(content_weight, previous_weight, noise_weight)
+            print('\n{}Phase {}{}: variety {}, weights {}, iterations {}.{}'\
+                 .format(ansi.CYAN_B, l, ansi.CYAN, variety, weights, iterations, ansi.ENDC))
             channels, iter_time = self.model.channels[l], time.time()
 
             for j in range(iterations):
-                self.normalize_components(l, desired_feature, self.compute_norms(np, l, desired_feature))
-                self.matcher_tensors[l].set_value(desired_feature)
-
                 # Compute best matching patches this style layer, going through all slices.
                 best_idx, best_val = self.evaluate_slices(desired_feature, l, variety)
-
-                patches = self.style_data[l][0]
                 current_best = patches[best_idx].astype(np.float32)
 
                 better_patches = current_best.transpose((0, 2, 3, 1))
                 better_shape = desired_feature.shape[2:] + (desired_feature.shape[1],)
                 better_features = reconstruct_from_patches_2d(better_patches, better_shape)
-                desired_feature = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
-                desired_feature = (1.0 - balance) * current_feature + (0.0 + balance) * desired_feature
+                better_features = better_features.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
+
+                # The new set of features is a blend of matched patches, input image, and previous layer.
+                desired_feature = (1.0 - previous_weight - content_weight) * better_features \
+                                + content_weight * content_feature + previous_weight * previous_feature \
+                                + noise_weight * np.random.normal(0.0, 1.0, size=previous_feature.shape).astype(np.float32)
 
                 used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
                 dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
@@ -532,9 +540,9 @@ class NeuralGenerator(object):
                 self.render(frame, l, desired_feature)
                 iter_time = time.time()
 
-            desired_feature = compute(desired_feature[:,:channels], self.content_map)
+            previous_feature = compute(desired_feature[:,:channels], self.content_map)
 
-        return desired_feature
+        return previous_feature
 
     def render(self, frame, layer, features):
         """Decode features at a specific layer and save the result to disk for visualization. (Takes 50% more time.) 
