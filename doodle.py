@@ -36,8 +36,8 @@ add_arg('--content',         default=None, type=str,         help='Subject image
 add_arg('--style',           default=None, type=str,         help='Texture image path to extract patches from.')
 add_arg('--layers',          default=['5_1','4_1','3_1'], nargs='+', type=str, help='The layers/scales to process.')
 add_arg('--variety',         default=[0.2, 0.1, 0.0], nargs='+', type=float,   help='Bias selecting diverse patches')
+add_arg('--previous-weight', default=[0.0, 0.2], nargs='+', type=float,        help='Weight of previous layer features.')
 add_arg('--content-weight',  default=[0.0], nargs='+', type=float, help='Weight of input content features each layer.')
-add_arg('--previous-weight', default=[0.2], nargs='+', type=float, help='Weight of previous layer features.')
 add_arg('--noise-weight',    default=[0.0], nargs='+', type=float, help='Weight of noise added into features.')
 add_arg('--iterations',      default=[6,4,2], nargs='+', type=int, help='Number of iterations to run in each phase.')
 add_arg('--shapes',          default=[3], nargs='+', type=int, help='Size of kernels used for patch extraction.')
@@ -516,6 +516,13 @@ class NeuralGenerator(object):
                  .format(ansi.CYAN_B, l, ansi.CYAN, variety, weights, iterations, ansi.ENDC))
             channels, iter_time = self.model.channels[l], time.time()
 
+            """"
+            # Remap the content features onto the style range, helps with blending primarily as patch-matching is normalized.
+            smin, smax = patches.min(axis=(0,2,3), keepdims=True), patches.max(axis=(0,2,3), keepdims=True)
+            cmin, cmax = content_feature.min(axis=(0,2,3), keepdims=True), content_feature.max(axis=(0,2,3), keepdims=True)
+            content_feature = (content_feature - cmin) / (cmax - cmin + 1E-9) * (smax - smin + 1E-9) + smin
+            """
+
             for j in range(iterations):
                 # Compute best matching patches this style layer, going through all slices.
                 best_idx, best_val = self.evaluate_slices(desired_feature, l, variety)
@@ -533,10 +540,9 @@ class NeuralGenerator(object):
 
                 used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
                 dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
-                err = best_val.mean()
+                err, frame = best_val.mean(), frame + 1
                 print('{:>3}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'.format(frame, ansi.BOLD, ansi.ENDC, used, dups, ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
 
-                frame += 1
                 self.render(frame, l, desired_feature)
                 iter_time = time.time()
 
@@ -553,7 +559,7 @@ class NeuralGenerator(object):
 
         output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_shape)
         filename = os.path.splitext(os.path.basename(args.output))[0]
-        scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}-L{}.png'.format(filename, frame, layer[0]))
+        scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}.png'.format(filename, frame))
 
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
