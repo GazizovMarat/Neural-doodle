@@ -397,7 +397,7 @@ class NeuralGenerator(object):
         self.content_features, feature = [], self.content_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *_ = encoder(feature, self.content_map)
-            self.content_features.append(feature)
+            self.content_features.insert(0, feature)
             print('  - Layer {} as {} array in {:,}kb.'.format(layer, feature.shape[1:], feature.size//1000))
 
     def prepare_generation(self):
@@ -504,8 +504,6 @@ class NeuralGenerator(object):
     def evaluate_feature(self, layer, feature, variety=0.0):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
         """
-        return feature # TODO
-
         patches = self.style_data[layer][0]
         best_idx, best_val = self.evaluate_slices(layer, feature, variety)
         better_patches = patches[best_idx].astype(np.float32).transpose((0, 2, 3, 1))
@@ -550,7 +548,7 @@ class NeuralGenerator(object):
                 assert previous_weight + content_weight < 1.0, "Previous and content weight should total below 1.0!"
             """
 
-        return self.decoders[-1](current_features[0], self.content_map)
+        return self.decoders[-1](current_features[-1], self.content_map)
 
         """"
         used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
