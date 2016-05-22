@@ -188,7 +188,7 @@ class Model(object):
         net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
 
         def ConcatenateLayer(incoming, layer):
-            return ConcatLayer([incoming, net['map%i'%(int(layer[0])-1)]]) if args.semantic_weight > 0.0 else incoming
+            return ConcatLayer([incoming, net['map%i'%int(layer[0])]]) if args.semantic_weight > 0.0 else incoming
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
         for layer, upper, lower in zip(args.layers, [None] + args.layers[:-1], args.layers[1:] + [None]):
@@ -196,7 +196,6 @@ class Model(object):
             net['sem'+layer] = ConcatenateLayer(net['enc'+layer], layer)
             net['dup'+layer] = InputLayer(net['enc'+layer].output_shape)
             net['nn'+layer]  = ConvLayer(ConcatenateLayer(net['dup'+layer], layer), 1, 3, b=None, pad=0, flip_filters=False)
-
         self.network = net
 
     def load_data(self):
@@ -348,6 +347,7 @@ class NeuralGenerator(object):
         self.style_data, feature = {}, self.style_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *data = encoder(feature, self.style_map)
+            feature = feature[:,:self.model.channels[layer]]
             patches, l = data[0], self.model.network['nn'+layer]
             l.num_filters = patches.shape[0] // args.slices
             self.style_data[layer] = [d[:l.num_filters*args.slices].astype(np.float16) for d in data]\
@@ -397,6 +397,7 @@ class NeuralGenerator(object):
         self.content_features, feature = [], self.content_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *_ = encoder(feature, self.content_map)
+            feature = feature[:,:self.model.channels[layer]]
             self.content_features.insert(0, feature)
             print('  - Layer {} as {} array in {:,}kb.'.format(layer, feature.shape[1:], feature.size//1000))
 
@@ -407,9 +408,11 @@ class NeuralGenerator(object):
         self.matcher_tensors = {l: lasagne.utils.shared_empty(dim=4) for l in args.layers}
         self.matcher_history = {l: T.vector() for l in args.layers}
         self.matcher_inputs = {self.model.network['dup'+l]: self.matcher_tensors[l] for l in args.layers}
+        self.matcher_inputs.update({self.model.network['map']: self.model.tensor_map})
         nn_layers = [self.model.network['nn'+l] for l in args.layers]
         self.matcher_outputs = dict(zip(args.layers, lasagne.layers.get_output(nn_layers, self.matcher_inputs)))
-        self.compute_matches = {l: self.compile([self.matcher_history[l]], self.do_match_patches(l)) for l in args.layers}
+        self.compute_matches = {l: self.compile([self.matcher_history[l], self.model.tensor_map],
+                                                self.do_match_patches(l)) for l in args.layers}
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0_0', self.model.tensor_img)]
@@ -489,7 +492,7 @@ class NeuralGenerator(object):
             self.normalize_components(l, weights, (bi, bs))
             layer.W.set_value(weights)
 
-            cur_idx, cur_val, cur_match = self.compute_matches[l](history[idx])
+            cur_idx, cur_val, cur_match = self.compute_matches[l](history[idx], self.content_map)
             if best_idx is None:
                 best_idx, best_val = cur_idx, cur_val
             else:
@@ -507,7 +510,7 @@ class NeuralGenerator(object):
 
         patches = self.style_data[layer][0]
         best_idx, best_val = self.evaluate_slices(layer, feature, variety)
-        better_patches = patches[best_idx].astype(np.float32).transpose((0, 2, 3, 1))
+        better_patches = patches[best_idx,:self.model.channels[layer]].astype(np.float32).transpose((0, 2, 3, 1))
         better_shape = feature.shape[2:] + (feature.shape[1],)
         better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
 
@@ -521,13 +524,6 @@ class NeuralGenerator(object):
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
     def evaluate_merge(self, features):
-        """
-        # The new set of features is a blend of matched patches, input image, and previous layer.
-        desired_feature = (1.0 - previous_weight - content_weight) * better_features \
-                            + content_weight * content_feature + previous_weight * previous_feature \
-                            + 
-        """
-
         decoded1 = [decode(data, self.content_map) for decode, data in zip(self.decoders, features[:-1])]
         encoded1 = [encode(data, self.content_map) for encode, data in zip(self.encoders, features[+1:])]
 
@@ -550,17 +546,15 @@ class NeuralGenerator(object):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
         frame = 0
-        # 
-        # parameters = zip(args.layers, *[extend(a) for a in layer_params])
-
         current_features = [np.copy(f) for f in self.content_features]
         self.render(frame, args.layers[0], current_features[0])
 
         for j in range(args.iterations):
             frame += 1
             print('\n{}Iteration {}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
-            desired_features = [self.evaluate_feature(l, f) for l, f in zip(args.layers, current_features)]
-            current_features = self.evaluate_merge(desired_features)
+            for i in range(2):
+                current_features = [self.evaluate_feature(l, f, v) for l, f, v in zip(args.layers, current_features, extend(args.variety))]
+            current_features = self.evaluate_merge(current_features)
             self.render(frame, args.layers[-1], current_features[-1])
 
         return self.decoders[-1](current_features[-1], self.content_map)
