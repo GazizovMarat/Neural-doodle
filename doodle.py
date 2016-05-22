@@ -503,13 +503,21 @@ class NeuralGenerator(object):
     def evaluate_feature(self, layer, feature, variety=0.0):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
         """
-        print('layer', layer, '...', end='', flush=True)
+        iter_time = time.time()
+
         patches = self.style_data[layer][0]
         best_idx, best_val = self.evaluate_slices(layer, feature, variety)
         better_patches = patches[best_idx].astype(np.float32).transpose((0, 2, 3, 1))
         better_shape = feature.shape[2:] + (feature.shape[1],)
         better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
-        print(' done!')
+
+        used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
+        dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
+        err = best_val.mean()
+        print('  {}layer{} {:>3}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
+              .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, dups,
+                      ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
+
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
     def evaluate_merge(self, features):
@@ -517,67 +525,45 @@ class NeuralGenerator(object):
         # The new set of features is a blend of matched patches, input image, and previous layer.
         desired_feature = (1.0 - previous_weight - content_weight) * better_features \
                             + content_weight * content_feature + previous_weight * previous_feature \
-                            + noise_weight * np.random.normal(0.0, 1.0, size=previous_feature.shape).astype(np.float32)
+                            + 
         """
 
-        print('features', [f.shape for f in features])
         decoded1 = [decode(data, self.content_map) for decode, data in zip(self.decoders, features[:-1])]
         encoded1 = [encode(data, self.content_map) for encode, data in zip(self.encoders, features[+1:])]
 
         decoded2 = [decode(data, self.content_map) for decode, data in zip(self.decoders[+1:], decoded1[:-1])]
         encoded2 = [encode(data, self.content_map) for encode, data in zip(self.encoders[:-1], encoded1[+1:])]
-        
+
         decoded1[-1] = (decoded1[-1] + decoded2[-1]) * 0.5
         encoded1[+0] = (encoded1[+0] + encoded2[+0]) * 0.5
-
-        return [(features[0] + encoded1[0]) / 2.0, (features[1] + encoded1[1] + decoded1[0]) / 3.0, (features[2] + decoded1[1]) / 2.0] 
+        exchanged = [encoded1[0], (encoded1[1] + decoded1[0]) / 2.0, decoded1[1]]
+        
+        params, result = zip(*[extend(a) for a in [args.content_weight, args.previous_weight, args.noise_weight]]), []
+        for f, c, e, p in zip(features, self.content_features, exchanged, params):
+            content_weight, previous_weight, noise_weight = p
+            mixed = f * (1.0 - content_weight - previous_weight) + c * content_weight + e * previous_weight \
+                  + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * noise_weight
+            result.append(mixed)
+        return result
 
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
         frame = 0
-        layer_params = [args.iterations, args.content_weight, args.previous_weight, args.noise_weight, args.variety]
+        # 
         # parameters = zip(args.layers, *[extend(a) for a in layer_params])
-
-        """
-            weights = 'c={:0.1f} p={:0.1f} n={:0.1f}'.format(content_weight, previous_weight, noise_weight)
-            print('\n{}Phase {}{}: variety {}, weights {}, iterations {}.{}'\
-                .format(ansi.CYAN_B, l, ansi.CYAN, variety, weights, iterations, ansi.ENDC))
-            channels, iter_time = self.model.channels[l], time.time()
-        """
 
         current_features = [np.copy(f) for f in self.content_features]
         self.render(frame, args.layers[0], current_features[0])
 
         for j in range(args.iterations):
+            frame += 1
+            print('\n{}Iteration {}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
             desired_features = [self.evaluate_feature(l, f) for l, f in zip(args.layers, current_features)]
             current_features = self.evaluate_merge(desired_features)
+            self.render(frame, args.layers[-1], current_features[-1])
 
-            """
-            for parameter, content_feature, compute in zip(parameters, self.content_features, self.decoders):
-                l, iterations, content_weight, previous_weight, noise_weight, variety = parameter
-                desired_feature, patches = np.copy(previous_feature), self.style_data[l][0]
-                assert previous_weight + content_weight < 1.0, "Previous and content weight should total below 1.0!"
-            """
-
-        """
-        data = current_features[0]
-        data = self.decoders[0](data, self.content_map)
-        data = (data + current_features[1]) * 0.5
-        data = self.decoders[1](data, self.content_map)
-        output = (data + current_features[2]) * 0.5
-        """
         return self.decoders[-1](current_features[-1], self.content_map)
-
-        """"
-        used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
-        dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
-        err, frame = best_val.mean(), frame + 1
-        print('{:>3}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'.format(frame, ansi.BOLD, ansi.ENDC, used, dups, ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
-
-        self.render(frame, l, desired_feature)
-        iter_time = time.time()
-        """
 
     def render(self, frame, layer, features):
         """Decode features at a specific layer and save the result to disk for visualization. (Takes 50% more time.) 
@@ -593,7 +579,6 @@ class NeuralGenerator(object):
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
         """
-
         self.model.setup(layers=['enc'+l for l in args.layers] + ['sem'+l for l in args.layers] + ['dec'+l for l in args.layers])
         self.prepare_style()
         self.prepare_content()
