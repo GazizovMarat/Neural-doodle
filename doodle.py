@@ -131,7 +131,7 @@ class Model(object):
         for l in args.layers:
             self.tensor_latent.append((l, T.tensor4()))
             # TODO: Move equation to calculate unit numbers into a common function, call from below too.
-            net['lat'+l] = InputLayer((None, 32 * 2**(int(l[0])-1), None, None), var=self.tensor_latent[-1][1])
+            net['lat'+l] = InputLayer((None, min(768, 32 * 2**(int(l[0])-1)), None, None), var=self.tensor_latent[-1][1])
 
         def EncdLayer(previous, channels, filter_size, **params):
             incoming = net['lat'+previous] if previous in args.layers else net['enc'+previous]
@@ -335,7 +335,7 @@ class NeuralGenerator(object):
         self.style_img = self.model.prepare_image(style_img_original)
         self.style_map = style_map_original.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
 
-        input_tensors = reversed([('0_0', self.model.tensor_img)] + self.model.tensor_latent[1:])
+        input_tensors = self.model.tensor_latent[1:] + [('0_0', self.model.tensor_img)]
         self.encoders = []
         for layer, (input, tensor_latent), shape in zip(args.layers, input_tensors, extend(args.shapes)):
             output = lasagne.layers.get_output(self.model.network['sem'+layer],
@@ -412,8 +412,7 @@ class NeuralGenerator(object):
         self.compute_matches = {l: self.compile([self.matcher_history[l]], self.do_match_patches(l)) for l in args.layers}
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
-        input_tensors = reversed([('0_0', self.model.tensor_img)] + self.model.tensor_latent[1:])
-        self.encoders = []
+        self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0_0', self.model.tensor_img)]
         for layer, (input, tensor_latent) in zip(args.layers, input_tensors):
             layer = lasagne.layers.get_output(self.model.network['enc'+layer],
                                              {self.model.network['lat'+input]: tensor_latent,
@@ -422,7 +421,7 @@ class NeuralGenerator(object):
             self.encoders.append(fn)
 
         self.decoders, output_layers = [], (['dec'+l for l in args.layers[1:]] + ['out'])
-        for layer, (_, tensor_latent), output in zip(args.layers, self.model.tensor_latent, output_layers):
+        for layer, (tt, tensor_latent), output in zip(args.layers, self.model.tensor_latent, output_layers):
             output = output.replace('_1', '_2')
             layer = lasagne.layers.get_output(self.model.network[output],
                                              {self.model.network['lat'+layer]: tensor_latent,
@@ -504,11 +503,13 @@ class NeuralGenerator(object):
     def evaluate_feature(self, layer, feature, variety=0.0):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
         """
+        print('layer', layer, '...', end='', flush=True)
         patches = self.style_data[layer][0]
         best_idx, best_val = self.evaluate_slices(layer, feature, variety)
         better_patches = patches[best_idx].astype(np.float32).transpose((0, 2, 3, 1))
         better_shape = feature.shape[2:] + (feature.shape[1],)
         better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
+        print(' done!')
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
     def evaluate_merge(self, features):
@@ -518,7 +519,18 @@ class NeuralGenerator(object):
                             + content_weight * content_feature + previous_weight * previous_feature \
                             + noise_weight * np.random.normal(0.0, 1.0, size=previous_feature.shape).astype(np.float32)
         """
-        return features
+
+        print('features', [f.shape for f in features])
+        decoded1 = [decode(data, self.content_map) for decode, data in zip(self.decoders, features[:-1])]
+        encoded1 = [encode(data, self.content_map) for encode, data in zip(self.encoders, features[+1:])]
+
+        decoded2 = [decode(data, self.content_map) for decode, data in zip(self.decoders[+1:], decoded1[:-1])]
+        encoded2 = [encode(data, self.content_map) for encode, data in zip(self.encoders[:-1], encoded1[+1:])]
+        
+        decoded1[-1] = (decoded1[-1] + decoded2[-1]) * 0.5
+        encoded1[+0] = (encoded1[+0] + encoded2[+0]) * 0.5
+
+        return [(features[0] + encoded1[0]) / 2.0, (features[1] + encoded1[1] + decoded1[0]) / 3.0, (features[2] + decoded1[1]) / 2.0] 
 
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
@@ -548,6 +560,13 @@ class NeuralGenerator(object):
                 assert previous_weight + content_weight < 1.0, "Previous and content weight should total below 1.0!"
             """
 
+        """
+        data = current_features[0]
+        data = self.decoders[0](data, self.content_map)
+        data = (data + current_features[1]) * 0.5
+        data = self.decoders[1](data, self.content_map)
+        output = (data + current_features[2]) * 0.5
+        """
         return self.decoders[-1](current_features[-1], self.content_map)
 
         """"
