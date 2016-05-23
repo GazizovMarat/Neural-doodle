@@ -524,21 +524,21 @@ class NeuralGenerator(object):
 
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
-    def evaluate_merge(self, features):
-        decoded, encoded, ready = features, features, collections.defaultdict(list)
-        
+    def evaluate_exchange(self, features):
+        decoded, encoded, ready = features, features, {f.shape: [f] for f in features}
         for i in range(len(features)-1):
-            print('merge', i)
             decoded = [decode(data, self.content_map) for decode, data in zip(self.decoders[+i:len(self.decoders)], decoded[:-1])]
             encoded = [encode(data, self.content_map) for encode, data in zip(self.encoders[:len(self.encoders)-i], encoded[+1:])]
             for d in decoded: ready[d.shape].append(d)
             for e in encoded: ready[e.shape].append(e)
-        exchanged = [sum(ready[f.shape]) / len(ready[f.shape]) for f in features]
+        # TODO: Weighted contribution of features of this layer with other layers...
+        return [sum(ready.get(f.shape, [f])) / len(ready.get(f.shape, [f])) for f in features]
 
-        params, result = zip(*[extend(a) for a in [args.content_weight, args.previous_weight, args.noise_weight]]), []
-        for f, c, e, p in zip(features, self.content_features, exchanged, params):
-            content_weight, previous_weight, noise_weight = p
-            mixed = f * (1.0 - content_weight - previous_weight) + c * content_weight + e * previous_weight \
+    def evaluate_merge(self, features):
+        params, result = zip(*[extend(a) for a in [args.content_weight, args.noise_weight]]), []
+        for f, c, p in zip(features, self.content_features, params):
+            content_weight, noise_weight = p
+            mixed = f * (1.0 - content_weight) + c * content_weight \
                   + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * noise_weight
             result.append(mixed)
         return result
@@ -553,9 +553,9 @@ class NeuralGenerator(object):
         for j in range(args.iterations):
             frame += 1
             print('\n{}Iteration {}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
-            for i in range(1):
-                current_features = [self.evaluate_feature(l, f, v) for l, f, v in zip(args.layers, current_features, extend(args.variety))]
             current_features = self.evaluate_merge(current_features)
+            current_features = [self.evaluate_feature(l, f, v) for l, f, v in zip(args.layers, current_features, extend(args.variety))]
+            current_features = self.evaluate_exchange(current_features)
             self.render(frame, args.layers[-1], current_features[-1])
 
         return self.decoders[-1](current_features[-1], self.content_map)
