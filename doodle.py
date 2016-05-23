@@ -26,6 +26,7 @@ import time
 import pickle
 import argparse
 import itertools
+import collections
 
 
 # Configure all options first so we can later custom-load other libraries (Theano) based on device specified by user.
@@ -524,16 +525,16 @@ class NeuralGenerator(object):
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
     def evaluate_merge(self, features):
-        decoded1 = [decode(data, self.content_map) for decode, data in zip(self.decoders, features[:-1])]
-        encoded1 = [encode(data, self.content_map) for encode, data in zip(self.encoders, features[+1:])]
-
-        decoded2 = [decode(data, self.content_map) for decode, data in zip(self.decoders[+1:], decoded1[:-1])]
-        encoded2 = [encode(data, self.content_map) for encode, data in zip(self.encoders[:-1], encoded1[+1:])]
-
-        decoded1[-1] = (decoded1[-1] + decoded2[-1]) * 0.5
-        encoded1[+0] = (encoded1[+0] + encoded2[+0]) * 0.5
-        exchanged = [encoded1[0], (encoded1[1] + decoded1[0]) / 2.0, decoded1[1]]
+        decoded, encoded, ready = features, features, collections.defaultdict(list)
         
+        for i in range(len(features)-1):
+            print('merge', i)
+            decoded = [decode(data, self.content_map) for decode, data in zip(self.decoders[+i:len(self.decoders)], decoded[:-1])]
+            encoded = [encode(data, self.content_map) for encode, data in zip(self.encoders[:len(self.encoders)-i], encoded[+1:])]
+            for d in decoded: ready[d.shape].append(d)
+            for e in encoded: ready[e.shape].append(e)
+        exchanged = [sum(ready[f.shape]) / len(ready[f.shape]) for f in features]
+
         params, result = zip(*[extend(a) for a in [args.content_weight, args.previous_weight, args.noise_weight]]), []
         for f, c, e, p in zip(features, self.content_features, exchanged, params):
             content_weight, previous_weight, noise_weight = p
@@ -552,7 +553,7 @@ class NeuralGenerator(object):
         for j in range(args.iterations):
             frame += 1
             print('\n{}Iteration {}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
-            for i in range(2):
+            for i in range(1):
                 current_features = [self.evaluate_feature(l, f, v) for l, f, v in zip(args.layers, current_features, extend(args.variety))]
             current_features = self.evaluate_merge(current_features)
             self.render(frame, args.layers[-1], current_features[-1])
