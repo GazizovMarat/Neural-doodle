@@ -35,14 +35,15 @@ parser = argparse.ArgumentParser(description='Generate a new image by applying s
 add_arg = parser.add_argument
 add_arg('--content',         default=None, type=str,         help='Subject image path to repaint in new style.')
 add_arg('--style',           default=None, type=str,         help='Texture image path to extract patches from.')
+add_arg('--passes',          default=2, type=int,            help='Number of times to go over the whole image.')
 add_arg('--variety',         default=[.2,.1,.0], nargs='+', type=float, help='Bias selecting diverse patches')
 add_arg('--layers',          default=[5, 4, 3], nargs='+',  type=int,   help='The layers/scales to process.')
 add_arg('--layer-weight',    default=[1.0], nargs='+', type=float, help='Weight of previous layer features.')
 add_arg('--content-weight',  default=[0.3], nargs='+', type=float, help='Weight of input content features each layer.')
 add_arg('--noise-weight',    default=[0.1], nargs='+', type=float, help='Weight of noise added into features.')
 add_arg('--iterations',      default=[1], nargs='+', type=int,     help='Number of times to repeat layer optimization.')
-add_arg('--passes',          default=2, type=int,            help='Number of times to go over the whole image.')
-add_arg('--shapes',          default=[3], nargs='+', type=int, help='Size of kernels used for patch extraction.')
+add_arg('--shapes',          default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
+add_arg('--seed',            default=None, type=int,         help='Initial state for the random number generator.')
 add_arg('--semantic-ext',    default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=3.0, type=float,        help='Global weight of semantics vs. style features.')
 add_arg('--output',          default='output.png', type=str, help='Filename or path to save output once done.')
@@ -194,7 +195,7 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        data_file = os.path.join(os.path.dirname(__file__), 'gelu4_conv.pkl')
+        data_file = os.path.join(os.path.dirname(__file__), 'gelu3_conv.pkl')
         if not os.path.exists(data_file):
             error("Model file with pre-trained convolution layers not found. Download from here...",
                   "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu3_conv.pkl")
@@ -249,6 +250,7 @@ class NeuralGenerator(object):
         """Constructor sets up global variables, loads and validates files, then builds the model.
         """
         self.start_time = time.time()
+        np.random.seed(args.seed)
 
         # Prepare file output and load files specified as input.
         if args.frames is not False:
@@ -344,7 +346,7 @@ class NeuralGenerator(object):
             patches, l = data[0], self.model.network['nn%i'%layer]
             l.num_filters = patches.shape[0] // args.slices
             self.style_data[layer] = [d[:l.num_filters*args.slices].astype(np.float16) for d in data]\
-                                   + [np.zeros((patches.shape[0],), dtype=np.float16)]
+                                   + [np.zeros((patches.shape[0],), dtype=np.float16), -1]
             print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, patches.shape[:2], patches.shape[2:], patches.size//1000))
 
     def prepare_content(self, scale=1.0):
@@ -392,7 +394,7 @@ class NeuralGenerator(object):
             feature, *_ = encoder(feature, self.content_map)
             feature = feature[:,:self.model.channels[layer]]
             self.content_features.insert(0, feature)
-            print('  - Layer {} as {} array in {:,}kb.'.format(layer, feature.shape[1:], feature.size//1000))
+            print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
 
     def prepare_generation(self):
         """Layerwise synthesis images requires two sets of Theano functions to be compiled.
@@ -475,11 +477,9 @@ class NeuralGenerator(object):
         self.normalize_components(l, f, self.compute_norms(np, l, f))
         self.matcher_tensors[l].set_value(f)
 
-        layer, data = self.model.network['nn%i'%l], self.style_data[l]
-        history = data[-1]
-
+        layer, data, history = self.model.network['nn%i'%l], self.style_data[l], self.style_data[l][-2]
         best_idx, best_val = None, 0.0
-        for idx, (bp, bi, bs, bh) in self.iterate_batches(*data, batch_size=layer.num_filters):
+        for idx, (bp, bi, bs, bh) in self.iterate_batches(*data[:-1], batch_size=layer.num_filters):
             weights = bp.astype(np.float32)
             self.normalize_components(l, weights, (bi, bs))
             layer.W.set_value(weights)
@@ -495,27 +495,39 @@ class NeuralGenerator(object):
 
         return best_idx, best_val
 
-    def evaluate_feature(self, layer, feature, variety=0.0, iterations=1):
+    def evaluate_feature(self, layer, feature, variety=0.0):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
         """
         iter_time = time.time()
-        patches = self.style_data[layer][0]
+        patches, indices = self.style_data[layer][0], self.style_data[layer][-1]
 
-        for _ in range(iterations):
-            best_idx, best_val = self.evaluate_slices(layer, feature, variety)
-            better_patches = patches[best_idx,:self.model.channels[layer]].astype(np.float32).transpose((0, 2, 3, 1))
-            better_shape = feature.shape[2:] + (feature.shape[1],)
-            better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
-            feature = better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
+        best_idx, best_val = self.evaluate_slices(layer, feature, variety)
+        better_patches = patches[best_idx,:self.model.channels[layer]].astype(np.float32).transpose((0, 2, 3, 1))
+        better_shape = feature.shape[2:] + (feature.shape[1],)
+        better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
 
-            used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
-            dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
-            err = best_val.mean()
-            print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
-                .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, dups,
-                        ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
+        used = 99. * len(set(best_idx)) / best_idx.shape[0]
+        duplicates = 99. * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
+        changed = 99. * (1.0 - np.where(indices == best_idx)[0].shape[0] / best_idx.shape[0])
+        err = best_val.mean()
+        print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%  chgd {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
+             .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, duplicates, changed,
+                     ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
+                     
+        self.style_data[layer][-1] = best_idx
+        return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
-        return feature
+    def evaluate_features(self, features):
+        params = zip(*[extend(a) for a in [args.content_weight, args.noise_weight, args.variety, args.iterations]])
+        result = []
+        for l, f, c, p in zip(args.layers, features, self.content_features, params):
+            content_weight, noise_weight, variety, iterations = p
+            for _ in range(iterations):
+                feature = f * (1.0 - content_weight) + c * content_weight \
+                        + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * noise_weight
+                f = self.evaluate_feature(l, feature, variety)
+            result.append(f)
+        return result
 
     def evaluate_exchange(self, features):
         decoded, encoded = features, features
@@ -528,27 +540,17 @@ class NeuralGenerator(object):
             for e in encoded: ready[e.shape].append((e, weights[d.shape]))
         return [sum([a*w for a, w in ready.get(f.shape, [(f,1.0)])]) / sum([w for _, w in ready.get(f.shape, [(f,1.0)])]) for f in features]
 
-    def evaluate_merge(self, features):
-        params, result = zip(*[extend(a) for a in [args.content_weight, args.noise_weight]]), []
-        for f, c, p in zip(features, self.content_features, params):
-            content_weight, noise_weight = p
-            mixed = f * (1.0 - content_weight) + c * content_weight \
-                  + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * noise_weight
-            result.append(mixed)
-        return result
-
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
-        frame, extra = 0, [extend(args.variety), extend(args.iterations)]
+        frame = 0
         current_features = [np.copy(f) for f in self.content_features]
         self.render(frame, args.layers[0], current_features[0])
 
         for j in range(args.passes):
             frame += 1
-            print('\n{}Iteration {}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
-            current_features = self.evaluate_merge(current_features)
-            current_features = [self.evaluate_feature(l, f, *e) for l, f, *e in zip(args.layers, current_features, *extra)]
+            print('\n{}Pass #{}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
+            current_features = self.evaluate_features(current_features)
             current_features = self.evaluate_exchange(current_features)
             self.render(frame, args.layers[-1], current_features[-1])
 
