@@ -40,7 +40,8 @@ add_arg('--layers',          default=[5, 4, 3], nargs='+',  type=int,   help='Th
 add_arg('--layer-weight',    default=[1.0], nargs='+', type=float, help='Weight of previous layer features.')
 add_arg('--content-weight',  default=[0.3], nargs='+', type=float, help='Weight of input content features each layer.')
 add_arg('--noise-weight',    default=[0.1], nargs='+', type=float, help='Weight of noise added into features.')
-add_arg('--iterations',      default=1, type=int,            help='Number of iterations to run in each phase.')
+add_arg('--iterations',      default=[1], nargs='+', type=int,     help='Number of times to repeat layer optimization.')
+add_arg('--passes',          default=2, type=int,            help='Number of times to go over the whole image.')
 add_arg('--shapes',          default=[3], nargs='+', type=int, help='Size of kernels used for patch extraction.')
 add_arg('--semantic-ext',    default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=3.0, type=float,        help='Global weight of semantics vs. style features.')
@@ -193,13 +194,14 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        data_file = os.path.join(os.path.dirname(__file__), 'gelu3_conv.pkl')
+        data_file = os.path.join(os.path.dirname(__file__), 'gelu4_conv.pkl')
         if not os.path.exists(data_file):
             error("Model file with pre-trained convolution layers not found. Download from here...",
                   "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu3_conv.pkl")
 
         data = pickle.load(open(data_file, 'rb'))
         for layer, values in data.items():
+            if layer not in self.network: continue
             for p, v in zip(self.network[layer].get_params(), values):
                 assert p.get_value().shape == v.shape, "Layer `{}` in network has size {} but data is {}."\
                                                        .format(layer, p.get_value().shape, v.shape)
@@ -493,25 +495,27 @@ class NeuralGenerator(object):
 
         return best_idx, best_val
 
-    def evaluate_feature(self, layer, feature, variety=0.0):
+    def evaluate_feature(self, layer, feature, variety=0.0, iterations=1):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
         """
         iter_time = time.time()
-
         patches = self.style_data[layer][0]
-        best_idx, best_val = self.evaluate_slices(layer, feature, variety)
-        better_patches = patches[best_idx,:self.model.channels[layer]].astype(np.float32).transpose((0, 2, 3, 1))
-        better_shape = feature.shape[2:] + (feature.shape[1],)
-        better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
 
-        used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
-        dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
-        err = best_val.mean()
-        print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
-              .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, dups,
-                      ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
+        for _ in range(iterations):
+            best_idx, best_val = self.evaluate_slices(layer, feature, variety)
+            better_patches = patches[best_idx,:self.model.channels[layer]].astype(np.float32).transpose((0, 2, 3, 1))
+            better_shape = feature.shape[2:] + (feature.shape[1],)
+            better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
+            feature = better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
-        return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
+            used = 99.9 * len(set(best_idx)) / best_idx.shape[0]
+            dups = 99.9 * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
+            err = best_val.mean()
+            print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
+                .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, dups,
+                        ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
+
+        return feature
 
     def evaluate_exchange(self, features):
         decoded, encoded = features, features
@@ -536,15 +540,15 @@ class NeuralGenerator(object):
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
-        frame = 0
+        frame, extra = 0, [extend(args.variety), extend(args.iterations)]
         current_features = [np.copy(f) for f in self.content_features]
         self.render(frame, args.layers[0], current_features[0])
 
-        for j in range(args.iterations):
+        for j in range(args.passes):
             frame += 1
             print('\n{}Iteration {}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
             current_features = self.evaluate_merge(current_features)
-            current_features = [self.evaluate_feature(l, f, v) for l, f, v in zip(args.layers, current_features, extend(args.variety))]
+            current_features = [self.evaluate_feature(l, f, *e) for l, f, *e in zip(args.layers, current_features, *extra)]
             current_features = self.evaluate_exchange(current_features)
             self.render(frame, args.layers[-1], current_features[-1])
 
