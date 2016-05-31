@@ -182,14 +182,17 @@ class Model(object):
         net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
 
         def ConcatenateLayer(incoming, layer):
+            # TODO: The model is constructed too soon, we don't yet know if semantic_weight is needed. Fails if not.
             return ConcatLayer([incoming, net['map%i'%layer]]) if args.semantic_weight > 0.0 else incoming
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
+        self.pm_inputs, self.pm_buffers, self.pm_candidates = {}, {}, {}
         for layer, upper, lower in zip(args.layers, [None] + args.layers[:-1], args.layers[1:] + [None]):
             self.channels[layer] = net['enc%i_1'%layer].num_filters
             net['sem%i'%layer] = ConcatenateLayer(net['enc%i_1'%layer], layer)
-            net['dup%i'%layer] = InputLayer(net['enc%i_1'%layer].output_shape)
-            net['nn%i'%layer]  = ConvLayer(ConcatenateLayer(net['dup%i'%layer], layer), 1, 3, b=None, pad=0, flip_filters=False)
+            self.pm_inputs[layer] = T.ftensor4()
+            self.pm_buffers[layer] = T.ftensor4()
+            self.pm_candidates[layer] = T.itensor4()
         self.network = net
 
     def load_data(self):
@@ -335,17 +338,15 @@ class NeuralGenerator(object):
             output = lasagne.layers.get_output(self.model.network['sem%i'%layer],
                                               {self.model.network['lat'+input]: tensor_latent,
                                                self.model.network['map']: self.model.tensor_map})
-            fn = self.compile([tensor_latent, self.model.tensor_map], [output] + self.do_extract_patches([layer], [output], [shape]))
+            fn = self.compile([tensor_latent, self.model.tensor_map], [output] + self.do_extract_patches(layer, output))
             self.encoders.append(fn)
 
         # Store all the style patches layer by layer, resized to match slice size and cast to 16-bit for size. 
         self.style_data, feature = {}, self.style_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *data = encoder(feature, self.style_map)
-            feature = feature[:,:self.model.channels[layer]]
-            patches, l = data[0], self.model.network['nn%i'%layer]
-            l.num_filters = patches.shape[0] // args.slices
-            self.style_data[layer] = [d[:l.num_filters*args.slices].astype(np.float16) for d in data]\
+            feature, patches = feature[:,:self.model.channels[layer]], data[0]
+            self.style_data[layer] = [d.astype(np.float16) for d in data]\
                                    + [np.zeros((patches.shape[0],), dtype=np.float16), -1]
             print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, patches.shape[:2], patches.shape[2:], patches.size//1000))
 
@@ -400,13 +401,7 @@ class NeuralGenerator(object):
         """Layerwise synthesis images requires two sets of Theano functions to be compiled.
         """
         # Patch matching calculation that uses only pre-calculated features and a slice of the patches.
-        self.matcher_tensors = {l: lasagne.utils.shared_empty(dim=4) for l in args.layers}
-        self.matcher_history = {l: T.vector() for l in args.layers}
-        self.matcher_inputs = {self.model.network['dup%i'%l]: self.matcher_tensors[l] for l in args.layers}
-        self.matcher_inputs.update({self.model.network['map']: self.model.tensor_map})
-        nn_layers = [self.model.network['nn%i'%l] for l in args.layers]
-        self.matcher_outputs = dict(zip(args.layers, lasagne.layers.get_output(nn_layers, self.matcher_inputs)))
-        self.compute_matches = {l: self.compile([self.matcher_history[l], self.model.tensor_map],
+        self.compute_matches = {l: self.compile([self.model.pm_inputs[l], self.model.pm_buffers[l], self.model.pm_candidates[l]],
                                                 self.do_match_patches(l)) for l in args.layers}
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
@@ -431,90 +426,74 @@ class NeuralGenerator(object):
     # Theano Computation
     #------------------------------------------------------------------------------------------------------------------
 
-    def do_extract_patches(self, layers, outputs, sizes, stride=1):
+    def do_extract_patches(self, layer, output, stride=1):
         """This function builds a Theano expression that will get compiled an run on the GPU. It extracts 3x3 patches
         from the intermediate outputs in the model.
         """
-        results = []
-        for layer, output, size in zip(layers, outputs, sizes):
-            # Use a Theano helper function to extract "neighbors" of specific size, seems a bit slower than doing
-            # it manually but much simpler!
-            patches = theano.tensor.nnet.neighbours.images2neibs(output, (size, size), (stride, stride), mode='valid')
-            # Make sure the patches are in the shape required to insert them into the model as another layer.
-            patches = patches.reshape((-1, patches.shape[0] // output.shape[1], size, size)).dimshuffle((1, 0, 2, 3))
-            # Calculate the magnitude that we'll use for normalization at runtime, then store...
-            results.extend([patches] + self.compute_norms(T, layer, patches))
-        return results
+        return [output] + self.compute_norms(T, layer, output)
 
     def do_match_patches(self, layer):
-        # Use node in the model to compute the result of the normalized cross-correlation, using results from the
-        # nearest-neighbor layers called 'nn3_1' and 'nn4_1'.
-        dist = self.matcher_outputs[layer]
-        dist = dist.reshape((dist.shape[1], -1))
-        # Compute the score of each patch, taking into account statistics from previous iteration. This equalizes
-        # the chances of the patches being selected when the user requests more variety.
-        offset = self.matcher_history[layer].reshape((-1, 1))
-        scores = dist - offset
-        # Pick the best style patches for each patch in the current image, the result is an array of indices.
-        # Also return the maximum value along both axis, used to compare slices and add patch variety.
-        return [scores.argmax(axis=0), scores.max(axis=0), dist.max(axis=1)]
+        inputs = self.model.pm_inputs[layer]
+        buffers = self.model.pm_buffers[layer]
+        indices = self.model.pm_candidates[layer]
+
+        candidates = buffers[indices[:,:,:,0],:,indices[:,:,:,1],indices[:,:,:,2]].dimshuffle((3,0,1,2))
+        reference = inputs[0,:,1:-1,1:-1].dimshuffle((0,1,2,'x'))
+        scores = T.sum(candidates * reference, axis=(0))
+        return [scores.argmax(axis=(2)), scores.max(axis=(2))] # [scores.argmax(axis=0), scores.max(axis=0)]
 
 
     #------------------------------------------------------------------------------------------------------------------
     # Optimization Loop
     #------------------------------------------------------------------------------------------------------------------
 
-    def iterate_batches(self, *arrays, batch_size):
-        """Break down the data in arrays batch by batch and return them as a generator.
-        """ 
-        total_size = arrays[0].shape[0]
-        indices = np.arange(total_size)
-        for index in range(0, total_size, batch_size):
-            excerpt = indices[index:index + batch_size]
-            yield excerpt, [a[excerpt] for a in arrays]
-
-    def evaluate_slices(self, l, f, v):
+    def evaluate_patches(self, l, f, v):
+        buffers = self.style_data[l][0].astype(np.float32)
+        self.normalize_components(l, buffers, self.style_data[l][1:2])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
-        self.matcher_tensors[l].set_value(f)
 
-        layer, data, history = self.model.network['nn%i'%l], self.style_data[l], self.style_data[l][-2]
-        best_idx, best_val = None, 0.0
-        for idx, (bp, bi, bs, bh) in self.iterate_batches(*data[:-1], batch_size=layer.num_filters):
-            weights = bp.astype(np.float32)
-            self.normalize_components(l, weights, (bi, bs))
-            layer.W.set_value(weights)
+        SAMPLES = 64
+        indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
+        indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
+        indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
 
-            cur_idx, cur_val, cur_match = self.compute_matches[l](history[idx], self.content_map)
-            if best_idx is None:
-                best_idx, best_val = cur_idx, cur_val
-            else:
-                i = np.where(cur_val > best_val)
-                best_idx[i] = idx[cur_idx[i]]
-                best_val[i] = cur_val[i]
-            history[idx] = cur_match * v
+        identity = np.indices(buffers.shape[2:]).transpose((1,2,0))[:-2,:-2] + 1 # TODO: patchsize
+        indices[:,:,17,1:] = identity
 
-        return best_idx, best_val
+        best_idx, best_val = self.compute_matches[l](f, buffers, indices)
+        # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
+        accessors = np.concatenate([identity - 1, best_idx[:,:,np.newaxis]], axis=2)
+        ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
+        return ref_idx, best_val
 
     def evaluate_feature(self, layer, feature, variety=0.0):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
         """
         iter_time = time.time()
-        patches, indices = self.style_data[layer][0], self.style_data[layer][-1]
+        B, indices = self.style_data[layer][0][:,:,:,:,np.newaxis,np.newaxis].astype(np.float32), self.style_data[layer][-1]
+        best_idx, best_val = self.evaluate_patches(layer, feature, variety)
+        # better_patches = buffers[best_idx[:,:,0],:,best_idx[:,:,1],best_idx[:,:,2]]
+        i0, i1, i2 = best_idx[:,:,0], best_idx[:,:,1], best_idx[:,:,2]
 
-        best_idx, best_val = self.evaluate_slices(layer, feature, variety)
-        better_patches = patches[best_idx,:self.model.channels[layer]].astype(np.float32).transpose((0, 2, 3, 1))
+        better_patches = np.concatenate([np.concatenate([B[i0,:,i1-1,i2-1], B[i0,:,i1-1,i2+0], B[i0,:,i1-1,i2+1]], axis=4),
+                                         np.concatenate([B[i0,:,i1+0,i2-1], B[i0,:,i1+0,i2+0], B[i0,:,i1+0,i2+1]], axis=4),
+                                         np.concatenate([B[i0,:,i1+1,i2-1], B[i0,:,i1+1,i2+0], B[i0,:,i1+1,i2+1]], axis=4)], axis=3)
+
+        better_patches = better_patches.reshape((-1,)+better_patches.shape[2:]).transpose((0,2,3,1))
         better_shape = feature.shape[2:] + (feature.shape[1],)
         better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
 
-        used = 99. * len(set(best_idx)) / best_idx.shape[0]
-        duplicates = 99. * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
-        changed = 99. * (1.0 - np.where(indices == best_idx)[0].shape[0] / best_idx.shape[0])
+        # used = 99. * len(set(best_idx)) / best_idx.shape[0]
+        # duplicates = 99. * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
+        # changed = 99. * (1.0 - np.where(indices == best_idx)[0].shape[0] / best_idx.shape[0])
+        used, duplicates, changed = -1.0, -2.0, -3.0
+
         err = best_val.mean()
         print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%  chgd {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
              .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, duplicates, changed,
                      ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
                      
-        self.style_data[layer][-1] = best_idx
+        # self.style_data[layer][-1] = best_idx
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
     def evaluate_features(self, features):
