@@ -38,18 +38,18 @@ add_arg('--style',           default=None, type=str,         help='Texture image
 add_arg('--passes',          default=2, type=int,            help='Number of times to go over the whole image.')
 add_arg('--variety',         default=[.2,.1,.0], nargs='+', type=float, help='Bias selecting diverse patches')
 add_arg('--layers',          default=[5, 4, 3], nargs='+',  type=int,   help='The layers/scales to process.')
-add_arg('--layer-weight',    default=[1.0], nargs='+', type=float, help='Weight of previous layer features.')
-add_arg('--content-weight',  default=[0.3], nargs='+', type=float, help='Weight of input content features each layer.')
-add_arg('--noise-weight',    default=[0.1], nargs='+', type=float, help='Weight of noise added into features.')
-add_arg('--iterations',      default=[1], nargs='+', type=int,     help='Number of times to repeat layer optimization.')
+add_arg('--layer-weight',    default=[1.0], nargs='+',      type=float, help='Weight of previous layer features.')
+add_arg('--content-weight',  default=[.3,.2,.1], nargs='+', type=float, help='Weight of input content features each layer.')
+add_arg('--noise-weight',    default=[.2,.1,.0], nargs='+', type=float, help='Weight of noise added into features.')
+add_arg('--iterations',      default=[4, 4, 1], nargs='+',  type=int,   help='Number of times to repeat layer optimization.')
 add_arg('--shapes',          default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
 add_arg('--seed',            default=None, type=int,         help='Initial state for the random number generator.')
 add_arg('--semantic-ext',    default='_sem.png', type=str,   help='File extension for the semantic maps.')
-add_arg('--semantic-weight', default=3.0, type=float,        help='Global weight of semantics vs. style features.')
+add_arg('--semantic-weight', default=0.0, type=float,        help='Global weight of semantics vs. style features.')
 add_arg('--output',          default='output.png', type=str, help='Filename or path to save output once done.')
 add_arg('--output-size',     default=None, type=str,         help='Size of the output image, e.g. 512x512.')
 add_arg('--frames',          default=False, action='store_true',   help='Render intermediate frames, takes more time.')
-add_arg('--slices',          default=2, type=int,            help='Split patches up into this number of batches.')
+add_arg('--slices',          default=16, type=int,           help='Split patches up into this number of batches.')
 add_arg('--device',          default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
 args = parser.parse_args()
 
@@ -524,7 +524,7 @@ class NeuralGenerator(object):
             content_weight, noise_weight, variety, iterations = p
             for _ in range(iterations):
                 feature = f * (1.0 - content_weight) + c * content_weight \
-                        + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * noise_weight
+                        + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * (0.1 * noise_weight)
                 f = self.evaluate_feature(l, feature, variety)
             result.append(f)
         return result
