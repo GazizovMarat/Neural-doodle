@@ -379,7 +379,7 @@ class NeuralGenerator(object):
 
         if content_img_original is None:
             print("  - No content image found; seed was set to random noise.")
-            content_img_original = np.random.uniform(0, 64, content_map_original.shape[:2]+(3,)).astype(np.float32)
+            content_img_original = np.random.uniform(0, 256, content_map_original.shape[:2]+(3,)).astype(np.float32)
 
         if content_map_original.shape[2] != self.style_map.shape[1]:
             error("Mismatch in number of channels for style and content semantic map.",
@@ -403,6 +403,7 @@ class NeuralGenerator(object):
         # Patch matching calculation that uses only pre-calculated features and a slice of the patches.
         self.compute_matches = {l: self.compile([self.model.pm_inputs[l], self.model.pm_buffers[l], self.model.pm_candidates[l]],
                                                 self.do_match_patches(l)) for l in args.layers}
+        self.pm_previous = {}
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
@@ -452,18 +453,40 @@ class NeuralGenerator(object):
         self.normalize_components(l, buffers, self.style_data[l][1:2])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
-        SAMPLES = 64
+        SAMPLES = 128
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
-        indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
-        indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
 
-        identity = np.indices(buffers.shape[2:]).transpose((1,2,0))[:-2,:-2] + 1 # TODO: patchsize
-        indices[:,:,17,1:] = identity
+        ref_idx = self.pm_previous.get(l, None)
+        for _ in range(4):
+            indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
+            indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
 
-        best_idx, best_val = self.compute_matches[l](f, buffers, indices)
-        # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
-        accessors = np.concatenate([identity - 1, best_idx[:,:,np.newaxis]], axis=2)
-        ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
+            if ref_idx is not None:
+                indices[:,:,0,:] = ref_idx + (0,0,0)
+                indices[:,:,1,:] = ref_idx + (0,0,+1)
+                indices[:,:,2,:] = ref_idx + (0,+1,0)
+                indices[:,:,3,:] = ref_idx + (0,0,-1)
+                indices[:,:,4,:] = ref_idx + (0,-1,0)
+
+                indices[:-1,:,5,:] = ref_idx[+1:,:] + (0,-1,0)
+                indices[+1:,:,6,:] = ref_idx[:-1,:] + (0,+1,0)
+                indices[:,:-1,7,:] = ref_idx[:,+1:] + (0,0,-1)
+                indices[:,+1:,8,:] = ref_idx[:,:-1] + (0,0,+1)
+
+                indices[:,:,:9,1].clip(1, buffers.shape[2]-2, out=indices[:,:,:9,1])
+                indices[:,:,:9,2].clip(1, buffers.shape[3]-2, out=indices[:,:,:9,2])
+
+            best_idx, best_val = self.compute_matches[l](f, buffers, indices)
+
+            # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
+            identity = np.indices(f.shape[2:]).transpose((1,2,0))[:-2,:-2] + 1 # TODO: patchsize
+            accessors = np.concatenate([identity - 1, best_idx[:,:,np.newaxis]], axis=2)
+            ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
+
+            best_val *= 9.0
+            print('values', ref_idx.shape, best_val.min(), best_val.mean(), best_val.max())
+
+        self.pm_previous[l] = ref_idx
         return ref_idx, best_val
 
     def evaluate_feature(self, layer, feature, variety=0.0):
