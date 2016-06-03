@@ -306,6 +306,7 @@ class NeuralGenerator(object):
 
     def normalize_components(self, layer, array, norms):
         if args.semantic_weight > 0.0:
+            print(layer, self.model.channels, len(norms))
             array[:,self.model.channels[layer]:] /= (norms[1] * args.semantic_weight)
         array[:,:self.model.channels[layer]] /= (norms[0] * 3.0)
 
@@ -437,18 +438,13 @@ class NeuralGenerator(object):
         buffers = self.model.pm_buffers[layer]
         indices = self.model.pm_candidates[layer]
 
-        patches = theano.tensor.nnet.neighbours.images2neibs(inputs, (size, size), (stride, stride), mode='valid')
-        patches = patches.reshape((-1, patches.shape[0] // inputs.shape[1], size, size)).dimshuffle((1, 0, 2, 3))
-        patches = patches.reshape((inputs.shape[2]-2, inputs.shape[3]-2, patches.shape[1], patches.shape[2], patches.shape[3]))
-
-        B = buffers.reshape((buffers.shape[0], buffers.shape[1], buffers.shape[2], buffers.shape[3], 1, 1))
+        scores = 0.0
         i0, i1, i2 = indices[:,:,:,0], indices[:,:,:,1], indices[:,:,:,2]
-        candidates = T.concatenate([T.concatenate([B[i0,:,i1-1,i2-1], B[i0,:,i1-1,i2+0], B[i0,:,i1-1,i2+1]], axis=5),
-                                    T.concatenate([B[i0,:,i1+0,i2-1], B[i0,:,i1+0,i2+0], B[i0,:,i1+0,i2+1]], axis=5),
-                                    T.concatenate([B[i0,:,i1+1,i2-1], B[i0,:,i1+1,i2+0], B[i0,:,i1+1,i2+1]], axis=5)], axis=4)
-
-        reference = patches.dimshuffle((0,1,'x',2,3,4))
-        scores = T.sum(candidates * reference, axis=(3,4,5))
+        h, w = inputs.shape[2]-1, inputs.shape[3]-1
+        for y, x in itertools.product([-1, 0, +1], repeat=2):
+            candidates = buffers[i0,:,i1+y,i2+x].dimshuffle((3,0,1,2))
+            reference = inputs[0,:,1+y:h+y,1+x:w+x].dimshuffle((0,1,2,'x'))
+            scores += T.sum(candidates * reference, axis=(0))
         return [scores.argmax(axis=(2)), scores.max(axis=(2))]
 
 
@@ -458,10 +454,10 @@ class NeuralGenerator(object):
 
     def evaluate_patches(self, l, f, v):
         buffers = self.style_data[l][0].astype(np.float32)
-        self.normalize_components(l, buffers, self.style_data[l][1:2])
+        self.normalize_components(l, buffers, self.style_data[l][1:3])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
-        SAMPLES = 24
+        SAMPLES = 20
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
 
         ref_idx = self.pm_previous.get(l, None)
@@ -496,9 +492,10 @@ class NeuralGenerator(object):
                 indices[:,:,10:15,1].clip(1, buffers.shape[2]-2, out=indices[:,:,10:15,1])
                 indices[:,:,10:15,2].clip(1, buffers.shape[3]-2, out=indices[:,:,10:15,2])
             
-            # t = time.time()
-             best_idx, best_val = self.compute_matches[l](f, buffers, indices)
-            # print('delta', time.time() - t)
+            t = time.time()
+            print('compute_matches', f.shape, buffers.shape)
+            best_idx, best_val = self.compute_matches[l](f, buffers, indices)
+            print('patch_match', time.time() - t)
 
             # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
             identity = np.indices(f.shape[2:]).transpose((1,2,0))[:-2,:-2] + 1 # TODO: patchsize
