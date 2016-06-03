@@ -49,7 +49,6 @@ add_arg('--semantic-weight', default=0.0, type=float,        help='Global weight
 add_arg('--output',          default='output.png', type=str, help='Filename or path to save output once done.')
 add_arg('--output-size',     default=None, type=str,         help='Size of the output image, e.g. 512x512.')
 add_arg('--frames',          default=False, action='store_true',   help='Render intermediate frames, takes more time.')
-add_arg('--slices',          default=16, type=int,           help='Split patches up into this number of batches.')
 add_arg('--device',          default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
 args = parser.parse_args()
 
@@ -295,10 +294,10 @@ class NeuralGenerator(object):
                   .format(filename, map.shape[1::-1], mapname, img.shape[1::-1]))
         return [(self.rescale_image(i, scale) if i is not None else None) for i in [img, map]]
 
-    def compile(self, arguments, function):
+    def compile(self, arguments, function, **opts):
         """Build a Theano function that will run the specified expression on the GPU.
         """
-        return theano.function(list(arguments), function, on_unused_input='ignore', allow_input_downcast=True)
+        return theano.function(list(arguments), function, on_unused_input='ignore', allow_input_downcast=True, **opts)
 
     def compute_norms(self, backend, layer, array):
         ni = backend.sqrt(backend.sum(array[:,:self.model.channels[layer]] ** 2.0, axis=(1,), keepdims=True))
@@ -427,21 +426,30 @@ class NeuralGenerator(object):
     # Theano Computation
     #------------------------------------------------------------------------------------------------------------------
 
-    def do_extract_patches(self, layer, output, stride=1):
+    def do_extract_patches(self, layer, output):
         """This function builds a Theano expression that will get compiled an run on the GPU. It extracts 3x3 patches
         from the intermediate outputs in the model.
         """
         return [output] + self.compute_norms(T, layer, output)
 
-    def do_match_patches(self, layer):
+    def do_match_patches(self, layer, size=3, stride=1):
         inputs = self.model.pm_inputs[layer]
         buffers = self.model.pm_buffers[layer]
         indices = self.model.pm_candidates[layer]
 
-        candidates = buffers[indices[:,:,:,0],:,indices[:,:,:,1],indices[:,:,:,2]].dimshuffle((3,0,1,2))
-        reference = inputs[0,:,1:-1,1:-1].dimshuffle((0,1,2,'x'))
-        scores = T.sum(candidates * reference, axis=(0))
-        return [scores.argmax(axis=(2)), scores.max(axis=(2))] # [scores.argmax(axis=0), scores.max(axis=0)]
+        patches = theano.tensor.nnet.neighbours.images2neibs(inputs, (size, size), (stride, stride), mode='valid')
+        patches = patches.reshape((-1, patches.shape[0] // inputs.shape[1], size, size)).dimshuffle((1, 0, 2, 3))
+        patches = patches.reshape((inputs.shape[2]-2, inputs.shape[3]-2, patches.shape[1], patches.shape[2], patches.shape[3]))
+
+        B = buffers.reshape((buffers.shape[0], buffers.shape[1], buffers.shape[2], buffers.shape[3], 1, 1))
+        i0, i1, i2 = indices[:,:,:,0], indices[:,:,:,1], indices[:,:,:,2]
+        candidates = T.concatenate([T.concatenate([B[i0,:,i1-1,i2-1], B[i0,:,i1-1,i2+0], B[i0,:,i1-1,i2+1]], axis=5),
+                                    T.concatenate([B[i0,:,i1+0,i2-1], B[i0,:,i1+0,i2+0], B[i0,:,i1+0,i2+1]], axis=5),
+                                    T.concatenate([B[i0,:,i1+1,i2-1], B[i0,:,i1+1,i2+0], B[i0,:,i1+1,i2+1]], axis=5)], axis=4)
+
+        reference = patches.dimshuffle((0,1,'x',2,3,4))
+        scores = T.sum(candidates * reference, axis=(3,4,5))
+        return [scores.argmax(axis=(2)), scores.max(axis=(2))]
 
 
     #------------------------------------------------------------------------------------------------------------------
@@ -453,11 +461,11 @@ class NeuralGenerator(object):
         self.normalize_components(l, buffers, self.style_data[l][1:2])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
-        SAMPLES = 128
+        SAMPLES = 24
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
 
         ref_idx = self.pm_previous.get(l, None)
-        for _ in range(4):
+        for i in range(2 if l > 3 else 1):
             indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
             indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
 
@@ -475,16 +483,29 @@ class NeuralGenerator(object):
 
                 indices[:,:,:9,1].clip(1, buffers.shape[2]-2, out=indices[:,:,:9,1])
                 indices[:,:,:9,2].clip(1, buffers.shape[3]-2, out=indices[:,:,:9,2])
-
-            best_idx, best_val = self.compute_matches[l](f, buffers, indices)
+            
+            prev_idx = self.pm_previous.get(l+1, None)
+            if i == 0 and prev_idx is not None:
+                resh_idx = np.concatenate([scipy.ndimage.zoom(np.pad(prev_idx[:,:,i]*2, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis] for i in range(1, 3)], axis=(2))
+                indices[:,:,10,1:] = resh_idx[+1:-1,+1:-1]
+                indices[:,:,11,1:] = resh_idx[+2:  ,+2:  ]
+                indices[:,:,12,1:] = resh_idx[+2:  ,  :-2]
+                indices[:,:,13,1:] = resh_idx[  :-2,+2:  ]
+                indices[:,:,14,1:] = resh_idx[  :-2,  :-2]
+                
+                indices[:,:,10:15,1].clip(1, buffers.shape[2]-2, out=indices[:,:,10:15,1])
+                indices[:,:,10:15,2].clip(1, buffers.shape[3]-2, out=indices[:,:,10:15,2])
+            
+            # t = time.time()
+             best_idx, best_val = self.compute_matches[l](f, buffers, indices)
+            # print('delta', time.time() - t)
 
             # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
             identity = np.indices(f.shape[2:]).transpose((1,2,0))[:-2,:-2] + 1 # TODO: patchsize
             accessors = np.concatenate([identity - 1, best_idx[:,:,np.newaxis]], axis=2)
             ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
 
-            best_val *= 9.0
-            print('values', ref_idx.shape, best_val.min(), best_val.mean(), best_val.max())
+            print('values', ref_idx.shape, np.percentile(best_val, 5.0), best_val.mean(), np.percentile(best_val, 95.0))
 
         self.pm_previous[l] = ref_idx
         return ref_idx, best_val
