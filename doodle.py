@@ -124,7 +124,7 @@ class Model(object):
         and then adding augmentations for Semantic Style Transfer.
         """
         net, self.channels = {}, {}
-        self.units = {1: 32, 2: 56, 3: 88, 4: 136, 5: 224, 6: 360}
+        self.units = {1: 48, 2: 80, 3: 128, 4: 208, 5: 328, 6: 360}
 
         net['map'] = InputLayer((1, None, None, None))
         for j in range(6):
@@ -142,19 +142,19 @@ class Model(object):
         # Encoder part of the neural network, takes an input image and turns it into abstract patterns.
         net['img']    = previous or InputLayer((None, 3, None, None))
         net['enc0_0'], net['lat0'] = net['img'], net['img']
-        net['enc1_1'] = EncdLayer('0_0',  32, 3, pad=1)
-        net['enc1_2'] = EncdLayer('1_1',  32, 3, pad=1)
-        net['enc2_1'] = EncdLayer('1_2',  56, 2, pad=0, stride=(2,2))
-        net['enc2_2'] = EncdLayer('2_1',  56, 3, pad=1)
-        net['enc3_1'] = EncdLayer('2_2',  88, 2, pad=0, stride=(2,2))
-        net['enc3_2'] = EncdLayer('3_1',  88, 3, pad=1)
-        net['enc3_3'] = EncdLayer('3_2',  88, 3, pad=1)
-        net['enc4_1'] = EncdLayer('3_3', 136, 2, pad=0, stride=(2,2))
-        net['enc4_2'] = EncdLayer('4_1', 136, 3, pad=1)
-        net['enc4_3'] = EncdLayer('4_2', 136, 3, pad=1)
-        net['enc5_1'] = EncdLayer('4_3', 224, 2, pad=0, stride=(2,2))
-        net['enc5_2'] = EncdLayer('5_1', 224, 3, pad=1)
-        net['enc5_3'] = EncdLayer('5_2', 224, 3, pad=1)
+        net['enc1_1'] = EncdLayer('0_0',  48, 3, pad=1)
+        net['enc1_2'] = EncdLayer('1_1',  48, 3, pad=1)
+        net['enc2_1'] = EncdLayer('1_2',  80, 2, pad=0, stride=(2,2))
+        net['enc2_2'] = EncdLayer('2_1',  80, 3, pad=1)
+        net['enc3_1'] = EncdLayer('2_2', 128, 2, pad=0, stride=(2,2))
+        net['enc3_2'] = EncdLayer('3_1', 128, 3, pad=1)
+        net['enc3_3'] = EncdLayer('3_2', 128, 3, pad=1)
+        net['enc4_1'] = EncdLayer('3_3', 208, 2, pad=0, stride=(2,2))
+        net['enc4_2'] = EncdLayer('4_1', 208, 3, pad=1)
+        net['enc4_3'] = EncdLayer('4_2', 208, 3, pad=1)
+        net['enc5_1'] = EncdLayer('4_3', 328, 2, pad=0, stride=(2,2))
+        net['enc5_2'] = EncdLayer('5_1', 328, 3, pad=1)
+        net['enc5_3'] = EncdLayer('5_2', 328, 3, pad=1)
         net['enc6_1'] = EncdLayer('5_3', 360, 2, pad=0, stride=(2,2))
 
         def DecdLayer(copy, previous, channels, nonlinearity=lasagne.nonlinearities.elu):
@@ -163,19 +163,19 @@ class Model(object):
             return DeconvLayer(incoming, channels, dup.filter_size, stride=dup.stride, crop=dup.pad, nonlinearity=nonlinearity)
 
         # Decoder part of the neural network, takes abstract patterns and converts them into an image!
-        net['dec5_3'] = DecdLayer('6_1', 'enc6_1', 224)
-        net['dec5_2'] = DecdLayer('5_3', 'dec5_3', 224)
-        net['dec5_1'] = DecdLayer('5_2', 'dec5_2', 224)
-        net['dec4_3'] = DecdLayer('5_1', 'dec5_1', 136)
-        net['dec4_2'] = DecdLayer('4_3', 'dec4_3', 136)
-        net['dec4_1'] = DecdLayer('4_2', 'dec4_2', 136)
-        net['dec3_3'] = DecdLayer('4_1', 'dec4_1',  88)
-        net['dec3_2'] = DecdLayer('3_3', 'dec3_3',  88)
-        net['dec3_1'] = DecdLayer('3_2', 'dec3_2',  88)
-        net['dec2_2'] = DecdLayer('3_1', 'dec3_1',  56)
-        net['dec2_1'] = DecdLayer('2_2', 'dec2_2',  56)
-        net['dec1_2'] = DecdLayer('2_1', 'dec2_1',  32)
-        net['dec1_1'] = DecdLayer('1_2', 'dec1_2',  32)
+        net['dec5_3'] = DecdLayer('6_1', 'enc6_1', 328)
+        net['dec5_2'] = DecdLayer('5_3', 'dec5_3', 328)
+        net['dec5_1'] = DecdLayer('5_2', 'dec5_2', 328)
+        net['dec4_3'] = DecdLayer('5_1', 'dec5_1', 208)
+        net['dec4_2'] = DecdLayer('4_3', 'dec4_3', 208)
+        net['dec4_1'] = DecdLayer('4_2', 'dec4_2', 208)
+        net['dec3_3'] = DecdLayer('4_1', 'dec4_1', 128)
+        net['dec3_2'] = DecdLayer('3_3', 'dec3_3', 128)
+        net['dec3_1'] = DecdLayer('3_2', 'dec3_2', 128)
+        net['dec2_2'] = DecdLayer('3_1', 'dec3_1',  80)
+        net['dec2_1'] = DecdLayer('2_2', 'dec2_2',  80)
+        net['dec1_2'] = DecdLayer('2_1', 'dec2_1',  48)
+        net['dec1_1'] = DecdLayer('1_2', 'dec1_2',  48)
         net['dec0_1'] = DecdLayer('1_1', 'dec1_1',   3, nonlinearity=lasagne.nonlinearities.tanh)
         net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec0_1'], shared_axes=(0,1,2,3))
         net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
@@ -457,11 +457,11 @@ class NeuralGenerator(object):
         self.normalize_components(l, buffers, self.style_data[l][1:3])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
-        SAMPLES = 20
+        SAMPLES = 32
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
 
         ref_idx = self.pm_previous.get(l, None)
-        for i in range(2 if l > 3 else 1):
+        for i in range(16 if l > 3 else 8):
             indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
             indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
 
@@ -540,12 +540,15 @@ class NeuralGenerator(object):
     def evaluate_features(self, features):
         params = zip(*[extend(a) for a in [args.content_weight, args.noise_weight, args.variety, args.iterations]])
         result = []
-        for l, f, c, p in zip(args.layers, features, self.content_features, params):
+        for i, (l, c, p) in enumerate(zip(args.layers, self.content_features, params)):
+            f =  features[i]
             content_weight, noise_weight, variety, iterations = p
             for _ in range(iterations):
                 feature = f * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * (0.1 * noise_weight)
                 f = self.evaluate_feature(l, feature, variety)
+            if i+1 < len(features):
+                features[i+1] = self.decoders[i](f, self.content_map)
             result.append(f)
         return result
 
