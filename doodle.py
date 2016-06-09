@@ -457,11 +457,11 @@ class NeuralGenerator(object):
         self.normalize_components(l, buffers, self.style_data[l][1:3])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
-        SAMPLES = 32
+        SAMPLES = 24
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
 
-        ref_idx = self.pm_previous.get(l, None)
-        for i in range(16 if l > 3 else 8):
+        ref_idx, ref_val = self.pm_previous.get(l, (None, 0.0))
+        for i in itertools.count():
             indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
             indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
 
@@ -480,8 +480,9 @@ class NeuralGenerator(object):
                 indices[:,:,:9,1].clip(1, buffers.shape[2]-2, out=indices[:,:,:9,1])
                 indices[:,:,:9,2].clip(1, buffers.shape[3]-2, out=indices[:,:,:9,2])
             
-            prev_idx = self.pm_previous.get(l+1, None)
-            if i == 0 and prev_idx is not None:
+            previous = self.pm_previous.get(l+1, None)
+            if i == 0 and previous is not None:
+                prev_idx, ref_val = previous
                 resh_idx = np.concatenate([scipy.ndimage.zoom(np.pad(prev_idx[:,:,i]*2, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis] for i in range(1, 3)], axis=(2))
                 indices[:,:,10,1:] = resh_idx[+1:-1,+1:-1]
                 indices[:,:,11,1:] = resh_idx[+2:  ,+2:  ]
@@ -493,7 +494,6 @@ class NeuralGenerator(object):
                 indices[:,:,10:15,2].clip(1, buffers.shape[3]-2, out=indices[:,:,10:15,2])
             
             t = time.time()
-            print('compute_matches', f.shape, buffers.shape)
             best_idx, best_val = self.compute_matches[l](f, buffers, indices)
             print('patch_match', time.time() - t)
 
@@ -502,9 +502,13 @@ class NeuralGenerator(object):
             accessors = np.concatenate([identity - 1, best_idx[:,:,np.newaxis]], axis=2)
             ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
 
-            print('values', ref_idx.shape, np.percentile(best_val, 5.0), best_val.mean(), np.percentile(best_val, 95.0))
+            rv = np.percentile(best_val, 5.0)
+            print('values', ref_idx.shape, (rv - ref_val) / rv)
+            if (rv - ref_val) / rv < 0.1:
+                break
+            ref_val = rv
 
-        self.pm_previous[l] = ref_idx
+        self.pm_previous[l] = (ref_idx, ref_val)
         return ref_idx, best_val
 
     def evaluate_feature(self, layer, feature, variety=0.0):
