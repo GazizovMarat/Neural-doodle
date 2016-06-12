@@ -124,7 +124,7 @@ class Model(object):
         and then adding augmentations for Semantic Style Transfer.
         """
         net, self.channels = {}, {}
-        self.units = {1: 48, 2: 80, 3: 128, 4: 208, 5: 328, 6: 360}
+        self.units = {1: 48, 2: 80, 3: 128, 4: 208, 5: 328, 6: 536}
 
         net['map'] = InputLayer((1, None, None, None))
         for j in range(6):
@@ -155,7 +155,7 @@ class Model(object):
         net['enc5_1'] = EncdLayer('4_3', 328, 2, pad=0, stride=(2,2))
         net['enc5_2'] = EncdLayer('5_1', 328, 3, pad=1)
         net['enc5_3'] = EncdLayer('5_2', 328, 3, pad=1)
-        net['enc6_1'] = EncdLayer('5_3', 360, 2, pad=0, stride=(2,2))
+        net['enc6_1'] = EncdLayer('5_3', 536, 2, pad=0, stride=(2,2))
 
         def DecdLayer(copy, previous, channels, nonlinearity=lasagne.nonlinearities.elu):
             # Dynamically injects intermediate "pitstop" output layers in the decoder based on what the user specified as layers.
@@ -404,6 +404,9 @@ class NeuralGenerator(object):
         self.compute_matches = {l: self.compile([self.model.pm_inputs[l], self.model.pm_buffers[l], self.model.pm_candidates[l]],
                                                 self.do_match_patches(l)) for l in args.layers}
         self.pm_previous = {}
+        LayerInput = collections.namedtuple('LayerInput', ['array', 'weight'])
+        self.layer_inputs = [[LayerInput(self.content_features[i], w) for _, w in zip(args.layers, extend(args.layer_weight))]
+                                                                      for i, _ in enumerate(args.layers)]
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
@@ -503,8 +506,8 @@ class NeuralGenerator(object):
             ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
 
             rv = np.percentile(best_val, 5.0)
-            print('values', ref_idx.shape, (rv - ref_val) / rv)
-            if (rv - ref_val) / rv < 0.1:
+            print('values', ref_idx.shape, (rv - ref_val) / rv, rv)
+            if (rv - ref_val) / rv < 0.05:
                 break
             ref_val = rv
 
@@ -541,49 +544,44 @@ class NeuralGenerator(object):
         # self.style_data[layer][-1] = best_idx
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
-    def evaluate_features(self, features):
+    def evaluate_features(self):
         params = zip(*[extend(a) for a in [args.content_weight, args.noise_weight, args.variety, args.iterations]])
-        result = []
+        
         for i, (l, c, p) in enumerate(zip(args.layers, self.content_features, params)):
-            f =  features[i]
             content_weight, noise_weight, variety, iterations = p
-            for _ in range(iterations):
-                feature = f * (1.0 - content_weight) + c * content_weight \
-                        + np.random.normal(0.0, 1.0, size=f.shape).astype(np.float32) * (0.1 * noise_weight)
-                f = self.evaluate_feature(l, feature, variety)
-            if i+1 < len(features):
-                features[i+1] = self.decoders[i](f, self.content_map)
-            result.append(f)
-        return result
+            for j in range(iterations):
+                blended = sum([a*w for a, w in self.layer_inputs[i]]) / sum([w for _, w in self.layer_inputs[i]])
+                self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+                feature = blended * (1.0 - content_weight) + c * content_weight \
+                        + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
+                self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                result = self.evaluate_feature(l, feature, variety)
+                self.render(result, l, 'output-L{}I{}'.format(l, j+1))
+                self.layer_inputs[i][i].array[:] = result 
 
-    def evaluate_exchange(self, features):
-        decoded, encoded = features, features
-        weights = {f.shape: w for f, w in zip(features, extend(args.layer_weight))}
-        ready = {f.shape: [(f, weights[f.shape])] for f in features} 
-        for i in range(len(features)-1):
-            decoded = [decode(data, self.content_map) for decode, data in zip(self.decoders[+i:len(self.decoders)], decoded[:-1])]
-            encoded = [encode(data, self.content_map) for encode, data in zip(self.encoders[:len(self.encoders)-i], encoded[+1:])]
-            for d in decoded: ready[d.shape].append((d, weights[d.shape]))
-            for e in encoded: ready[e.shape].append((e, weights[d.shape]))
-        return [sum([a*w for a, w in ready.get(f.shape, [(f,1.0)])]) / sum([w for _, w in ready.get(f.shape, [(f,1.0)])]) for f in features]
+            if i+1 < len(args.layers):
+                for j in range(0, i+1):
+                    self.layer_inputs[i+1][j].array[:] = self.decoders[i](self.layer_inputs[i][j].array, self.content_map)
+
+        for i in range(len(args.layers)-1, 0, -1):
+            for j in range(i, len(args.layers)):
+                self.layer_inputs[i-1][j].array[:] = self.encoders[i-1](self.layer_inputs[i][j].array, self.content_map)
 
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
         """
-        frame = 0
-        current_features = [np.copy(f) for f in self.content_features]
-        self.render(frame, args.layers[0], current_features[0])
+        self.frame = 0
+        for i, c in zip(args.layers, self.content_features):
+            self.render(c, i, 'orig-L{}'.format(i))
 
         for j in range(args.passes):
-            frame += 1
-            print('\n{}Pass #{}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
-            current_features = self.evaluate_features(current_features)
-            current_features = self.evaluate_exchange(current_features)
-            self.render(frame, args.layers[-1], current_features[-1])
+            self.frame += 1
+            print('\n{}Pass #{}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, self.frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
+            self.evaluate_features()
 
-        return self.decoders[-1](current_features[-1], self.content_map)
+        return self.decoders[-1](self.layer_inputs[-1][-1].array, self.content_map)
 
-    def render(self, frame, layer, features):
+    def render(self, features, layer, suffix):
         """Decode features at a specific layer and save the result to disk for visualization. (Takes 50% more time.) 
         """
         if not args.frames: return
@@ -592,7 +590,7 @@ class NeuralGenerator(object):
 
         output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_shape)
         filename = os.path.splitext(os.path.basename(args.output))[0]
-        scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}.png'.format(filename, frame))
+        scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}-{}.png'.format(filename, self.frame, suffix))
 
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
