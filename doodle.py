@@ -50,6 +50,7 @@ add_arg('--output',          default='output.png', type=str, help='Filename or p
 add_arg('--output-size',     default=None, type=str,         help='Size of the output image, e.g. 512x512.')
 add_arg('--frames',          default=False, action='store_true',   help='Render intermediate frames, takes more time.')
 add_arg('--device',          default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
+add_arg('--model',           default='gelu3', type=str,      help='Filename for convolution weights of neural network.')
 args = parser.parse_args()
 
 
@@ -88,6 +89,7 @@ os.environ.setdefault('THEANO_FLAGS', 'floatX=float32,device={},force_device=Tru
 # Scientific & Imaging Libraries
 import numpy as np
 import scipy.optimize, scipy.ndimage, scipy.misc
+import numba
 import PIL.ImageOps
 from sklearn.feature_extraction.image import reconstruct_from_patches_2d
 
@@ -197,10 +199,10 @@ class Model(object):
     def load_data(self):
         """Open the serialized parameters from a pre-trained network, and load them into the model created.
         """
-        data_file = os.path.join(os.path.dirname(__file__), 'gelu3_conv.pkl')
+        data_file = os.path.join(os.path.dirname(__file__), '{}_conv.pkl'.format(args.model))
         if not os.path.exists(data_file):
             error("Model file with pre-trained convolution layers not found. Download from here...",
-                  "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu3_conv.pkl")
+                  "https://github.com/alexjc/neural-doodle/releases/download/v0.0/{}_conv.pkl".format(args.model))
 
         data = pickle.load(open(data_file, 'rb'))
         for layer, values in data.items():
@@ -238,6 +240,23 @@ class Model(object):
         image = np.swapaxes(np.swapaxes(image[::-1], 0, 1), 1, 2)
         image = np.clip(image, 0, 255).astype('uint8')
         return scipy.misc.imresize(image, resolution, interp='bicubic')
+
+
+
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:,:], numba.int32[:,:], numba.float32[:,:])],
+                    '(n,c,x,y),(n,c,z,w),(a,b,m,i)->(a,b),(a,b)', nopython=True, target='parallel')
+def compute_matches(inputs, buffers, indices, selected, best):
+    for a in range(indices.shape[0]):
+        for b in range(indices.shape[1]):
+            scores = np.zeros((indices.shape[2],), dtype=np.float32)
+            for m in range(indices.shape[2]):
+                i0, i1, i2 = indices[a,b,m,0], indices[a,b,m,1], indices[a,b,m,2]
+                for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
+                    candidates = buffers[i0,:,i1+y,i2+x]
+                    reference = inputs[0,:,1+a+y,1+b+x]
+                    scores[m] += np.sum(candidates * reference)
+            selected[a,b] = scores.argmax()
+            best[a,b] = scores.max()
 
 
 #----------------------------------------------------------------------------------------------------------------------
@@ -394,19 +413,23 @@ class NeuralGenerator(object):
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *_ = encoder(feature, self.content_map)
             feature = feature[:,:self.model.channels[layer]]
-            self.content_features.insert(0, feature)
+            style = self.style_data[layer][0]
+
+            sn, sx = style.min(axis=(0,2,3), keepdims=True), style.max(axis=(0,2,3), keepdims=True)
+            cn, cx = feature.min(axis=(0,2,3), keepdims=True), feature.max(axis=(0,2,3), keepdims=True)
+
+            self.content_features.insert(0, sn + (feature - cn) * (sx - sn) / (cx - cn))
             print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
 
     def prepare_generation(self):
         """Layerwise synthesis images requires two sets of Theano functions to be compiled.
         """
         # Patch matching calculation that uses only pre-calculated features and a slice of the patches.
-        self.compute_matches = {l: self.compile([self.model.pm_inputs[l], self.model.pm_buffers[l], self.model.pm_candidates[l]],
-                                                self.do_match_patches(l)) for l in args.layers}
+        # self.compute_matches = {l: self.compile([self.model.pm_inputs[l], self.model.pm_buffers[l], self.model.pm_candidates[l]], self.do_match_patches(l)) for l in args.layers}
         self.pm_previous = {}
         LayerInput = collections.namedtuple('LayerInput', ['array', 'weight'])
-        self.layer_inputs = [[LayerInput(self.content_features[i], w) for _, w in zip(args.layers, extend(args.layer_weight))]
-                                                                      for i, _ in enumerate(args.layers)]
+        self.layer_inputs = [[LayerInput(np.copy(self.content_features[i]), w) for _, w in zip(args.layers, extend(args.layer_weight))]
+                                                                               for i, _ in enumerate(args.layers)]
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
@@ -435,20 +458,6 @@ class NeuralGenerator(object):
         from the intermediate outputs in the model.
         """
         return [output] + self.compute_norms(T, layer, output)
-
-    def do_match_patches(self, layer, size=3, stride=1):
-        inputs = self.model.pm_inputs[layer]
-        buffers = self.model.pm_buffers[layer]
-        indices = self.model.pm_candidates[layer]
-
-        scores = 0.0
-        i0, i1, i2 = indices[:,:,:,0], indices[:,:,:,1], indices[:,:,:,2]
-        h, w = inputs.shape[2]-1, inputs.shape[3]-1
-        for y, x in itertools.product([-1, 0, +1], repeat=2):
-            candidates = buffers[i0,:,i1+y,i2+x].dimshuffle((3,0,1,2))
-            reference = inputs[0,:,1+y:h+y,1+x:w+x].dimshuffle((0,1,2,'x'))
-            scores += T.sum(candidates * reference, axis=(0))
-        return [scores.argmax(axis=(2)), scores.max(axis=(2))]
 
 
     #------------------------------------------------------------------------------------------------------------------
@@ -497,7 +506,7 @@ class NeuralGenerator(object):
                 indices[:,:,10:15,2].clip(1, buffers.shape[3]-2, out=indices[:,:,10:15,2])
             
             t = time.time()
-            best_idx, best_val = self.compute_matches[l](f, buffers, indices)
+            best_idx, best_val = compute_matches(f, buffers, indices)
             print('patch_match', time.time() - t)
 
             # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
@@ -506,8 +515,8 @@ class NeuralGenerator(object):
             ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
 
             rv = np.percentile(best_val, 5.0)
-            print('values', ref_idx.shape, (rv - ref_val) / rv, rv)
-            if (rv - ref_val) / rv < 0.05:
+            print('values', ref_idx.shape, (rv - ref_val) / rv, rv - ref_val, rv)
+            if abs(rv - ref_val) < 0.00005:
                 break
             ref_val = rv
 
