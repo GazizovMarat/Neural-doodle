@@ -187,13 +187,9 @@ class Model(object):
             return ConcatLayer([incoming, net['map%i'%layer]]) if args.semantic_weight > 0.0 else incoming
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
-        self.pm_inputs, self.pm_buffers, self.pm_candidates = {}, {}, {}
         for layer, upper, lower in zip(args.layers, [None] + args.layers[:-1], args.layers[1:] + [None]):
             self.channels[layer] = net['enc%i_1'%layer].num_filters
             net['sem%i'%layer] = ConcatenateLayer(net['enc%i_1'%layer], layer)
-            self.pm_inputs[layer] = T.ftensor4()
-            self.pm_buffers[layer] = T.ftensor4()
-            self.pm_candidates[layer] = T.itensor4()
         self.network = net
 
     def load_data(self):
@@ -246,16 +242,20 @@ class Model(object):
 # Fast Patch Matching
 #----------------------------------------------------------------------------------------------------------------------
 
+@numba.jit()
+def patches_score(current, buffers, i0, i1, i2, b, a):
+    score = 0.0
+    for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
+        score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
+    return score
+
 @numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:])],
                     '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b)', nopython=True, target='parallel')
 def patches_initialize(current, buffers, indices, scores):
     for b in range(indices.shape[0]):
         for a in range(indices.shape[1]):
             i0, i1, i2 = indices[b,a]
-            score = 0.0
-            for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
-                score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
-            scores[b,a] = score
+            scores[b,a] = patches_score(current, buffers, i0, i1, i2, b, a)
 
 @numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.float32[:])],
                     '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b),()', nopython=True)
@@ -268,9 +268,7 @@ def patches_propagate(current, buffers, indices, scores, i):
                                     - np.array(offset, dtype=np.int32)
                 i1 = min(buffers.shape[2]-2, max(i1, 1))
                 i2 = min(buffers.shape[3]-2, max(i2, 1))
-                score = 0.0
-                for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
-                    score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
+                score = patches_score(current, buffers, i0, i1, i2, b, a)
                 if score > scores[b,a]:
                     scores[b,a] = score
                     indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
@@ -286,9 +284,7 @@ def patches_search(current, buffers, indices, scores, k):
                 # i2 = min(buffers.shape[3]-2, max(i2 + random.randint(-w, +w), 1))
                 i1 = np.random.randint(1, buffers.shape[2]-1)
                 i2 = np.random.randint(1, buffers.shape[3]-1)
-                score = 0.0
-                for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
-                    score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
+                score = patches_score(current, buffers, i0, i1, i2, b, a)
                 if score > scores[b,a]:
                     scores[b,a] = score
                     indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
@@ -326,7 +322,7 @@ class NeuralGenerator(object):
     def rescale_image(self, img, scale):
         """Re-implementing skimage.transform.scale without the extra dependency. Saves a lot of space and hassle!
         """
-        output = scipy.misc.toimage(img, cmin=0.0, cmax=255)
+        output = scipy.misc.toimage(img, cmin=0.0, cmax=255.0)
         return np.asarray(PIL.ImageOps.fit(output, [snap(dim*scale) for dim in output.size], PIL.Image.ANTIALIAS))
 
     def load_images(self, name, filename, scale=1.0):
@@ -531,12 +527,12 @@ class NeuralGenerator(object):
         better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
 
         flat_idx = np.sum(best_idx.reshape((-1,3)) * np.array([B.shape[1]*B.shape[2], B.shape[2], 1]), axis=(1))
-        used = 99. * len(set(flat_idx)) / flat_idx.shape[0]
-        duplicates = 99. * len([v for v in np.bincount(flat_idx) if v>1]) / len(set(flat_idx))
-        changed = 99. * (1.0 - np.where(indices == flat_idx)[0].shape[0] / flat_idx.shape[0])
+        used = 100.0 * len(set(flat_idx)) / flat_idx.shape[0]
+        duplicates = 100.0 * len([v for v in np.bincount(flat_idx) if v>1]) / len(set(flat_idx))
+        changed = 100.0 * (1.0 - np.where(indices == flat_idx)[0].shape[0] / flat_idx.shape[0])
 
         err = best_val.mean()
-        print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%  chgd {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
+        print('  {}layer{} {:>1}   {}patches{}  used {:<3.0f}%  dups {:<3.0f}%  chgd {:<3.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
              .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, duplicates, changed,
                      ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
                      
