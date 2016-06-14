@@ -24,7 +24,6 @@ import sys
 import math
 import time
 import pickle
-import random
 import argparse
 import itertools
 import collections
@@ -276,17 +275,17 @@ def patches_propagate(current, buffers, indices, scores, i):
                     scores[b,a] = score
                     indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
 
-@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:])],
-                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b)', nopython=True, target='parallel')
-def patches_search(current, buffers, indices, scores):
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.int32[:])],
+                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b),()', nopython=True, target='parallel')
+def patches_search(current, buffers, indices, scores, k):
     for b in range(indices.shape[0]):
         for a in range(indices.shape[1]):
             i0, i1, i2 = indices[b,a]
-            for w in range(8):
+            for w in range(k[0]):
                 # i1 = min(buffers.shape[2]-2, max(i1 + random.randint(-w, +w), 1))
                 # i2 = min(buffers.shape[3]-2, max(i2 + random.randint(-w, +w), 1))
-                i1 = random.randint(1,buffers.shape[2]-2)
-                i2 = random.randint(1,buffers.shape[3]-2)
+                i1 = np.random.randint(1, buffers.shape[2]-1)
+                i2 = np.random.randint(1, buffers.shape[3]-1)
                 score = 0.0
                 for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
                     score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
@@ -494,31 +493,19 @@ class NeuralGenerator(object):
 
         scores = np.zeros((f.shape[2]-2, f.shape[3]-2), dtype=np.float32)   # TODO: patchsize
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, 3), dtype=np.int32) # TODO: patchsize
-        indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
-        indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
 
-        # Identity initialization.
-        # indices[:,:,1:] = np.indices(f.shape[2:]).transpose((1,2,0))[1:-1,1:-1]
-        # Propagation test.
-        # indices[:,:,1:] = 1
+        previous = self.pm_previous.get(l+1, None)
+        if previous is not None:
+            def rescale(a): return scipy.ndimage.zoom(np.pad(a, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis]
+            indices[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1]
+        else:
+            indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
+            indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
 
-        t = time.time()
         patches_initialize(f, buffers, indices, scores)
-        print('patches_initialize', time.time() - t)
-
-        for i in range(24):
-            t = time.time()
-            print(np.percentile(scores, [5.0, 25.0, 75.0, 95.0]))
+        for i in range(5):
             patches_propagate(f, buffers, indices, scores, i)
-            patches_search(f, buffers, indices, scores)
-            print('patches_propagate', i, time.time() - t)
-
-        """"
-            previous = self.pm_previous.get(l+1, None)
-            prev_idx, ref_val = previous
-            resh_idx = np.concatenate([scipy.ndimage.zoom(np.pad(prev_idx[:,:,i]*2, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis] for i in range(1, 3)], axis=(2))
-            indices[:,:,10,1:] = resh_idx[+1:-1,+1:-1]
-        """
+            patches_search(f, buffers, indices, scores, 5)
 
         self.pm_previous[l] = (indices, scores)
         return indices, scores
@@ -529,7 +516,6 @@ class NeuralGenerator(object):
         iter_time = time.time()
         B, indices = self.style_data[layer][0][:,:,:,:,np.newaxis,np.newaxis].astype(np.float32), self.style_data[layer][-1]
         best_idx, best_val = self.evaluate_patches(layer, feature, variety)
-        # better_patches = buffers[best_idx[:,:,0],:,best_idx[:,:,1],best_idx[:,:,2]]
         i0, i1, i2 = best_idx[:,:,0], best_idx[:,:,1], best_idx[:,:,2]
 
         better_patches = np.concatenate([np.concatenate([B[i0,:,i1-1,i2-1], B[i0,:,i1-1,i2+0], B[i0,:,i1-1,i2+1]], axis=4),
@@ -540,17 +526,17 @@ class NeuralGenerator(object):
         better_shape = feature.shape[2:] + (feature.shape[1],)
         better_feature = reconstruct_from_patches_2d(better_patches, better_shape)
 
-        # used = 99. * len(set(best_idx)) / best_idx.shape[0]
-        # duplicates = 99. * len([v for v in np.bincount(best_idx) if v>1]) / best_idx.shape[0]
-        # changed = 99. * (1.0 - np.where(indices == best_idx)[0].shape[0] / best_idx.shape[0])
-        used, duplicates, changed = -1.0, -2.0, -3.0
+        flat_idx = np.sum(best_idx.reshape((-1,3)) * np.array([B.shape[1]*B.shape[2], B.shape[2], 1]), axis=(1))
+        used = 99. * len(set(flat_idx)) / flat_idx.shape[0]
+        duplicates = 99. * len([v for v in np.bincount(flat_idx) if v>1]) / flat_idx.shape[0]
+        changed = 99. * (1.0 - np.where(indices == flat_idx)[0].shape[0] / flat_idx.shape[0])
 
         err = best_val.mean()
         print('  {}layer{} {:>1}   {}patches{}  used {:2.0f}%  dups {:2.0f}%  chgd {:2.0f}%   {}error{} {:3.2e}   {}time{} {:3.1f}s'\
              .format(ansi.BOLD, ansi.ENDC, layer, ansi.BOLD, ansi.ENDC, used, duplicates, changed,
                      ansi.BOLD, ansi.ENDC, err, ansi.BOLD, ansi.ENDC, time.time() - iter_time))
                      
-        # self.style_data[layer][-1] = best_idx
+        self.style_data[layer][-1] = flat_idx
         return better_feature.astype(np.float32).transpose((2, 0, 1))[np.newaxis]
 
     def evaluate_features(self):
@@ -560,10 +546,10 @@ class NeuralGenerator(object):
             content_weight, noise_weight, variety, iterations = p
             for j in range(iterations):
                 blended = sum([a*w for a, w in self.layer_inputs[i]]) / sum([w for _, w in self.layer_inputs[i]])
-                self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+                # self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
                 feature = blended * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
-                self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                # self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
                 result = self.evaluate_feature(l, feature, variety)
                 self.render(result, l, 'output-L{}I{}'.format(l, j+1))
                 self.layer_inputs[i][i].array[:] = result 
