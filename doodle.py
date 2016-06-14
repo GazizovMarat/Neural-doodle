@@ -449,10 +449,9 @@ class NeuralGenerator(object):
             feature = feature[:,:self.model.channels[layer]]
             style = self.style_data[layer][0]
 
-            # sn, sx = style.min(axis=(0,2,3), keepdims=True), style.max(axis=(0,2,3), keepdims=True)
-            # cn, cx = feature.min(axis=(0,2,3), keepdims=True), feature.max(axis=(0,2,3), keepdims=True)
-            # self.content_features.insert(0, sn + (feature - cn) * (sx - sn) / (cx - cn))
-            self.content_features.insert(0, feature)
+            sn, sx = style.min(axis=(0,2,3), keepdims=True), style.max(axis=(0,2,3), keepdims=True)
+            cn, cx = feature.min(axis=(0,2,3), keepdims=True), feature.max(axis=(0,2,3), keepdims=True)
+            self.content_features.insert(0, sn + (feature - cn) * (sx - sn) / (cx - cn))
             print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
 
     def prepare_generation(self):
@@ -494,18 +493,23 @@ class NeuralGenerator(object):
         scores = np.zeros((f.shape[2]-2, f.shape[3]-2), dtype=np.float32)   # TODO: patchsize
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, 3), dtype=np.int32) # TODO: patchsize
 
-        previous = self.pm_previous.get(l+1, None)
+        previous = self.pm_previous.get(l+1, None) 
         if previous is not None:
             def rescale(a): return scipy.ndimage.zoom(np.pad(a, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis]
             indices[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1]
         else:
             indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
             indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
-
         patches_initialize(f, buffers, indices, scores)
-        for i in range(5):
+
+        if l in self.pm_previous:
+            i, s = self.pm_previous[l]
+            w = np.where(s > scores)
+            indices[w], scores[w] = i[w], s[w]
+
+        for i in range((l-1)**2):
             patches_propagate(f, buffers, indices, scores, i)
-            patches_search(f, buffers, indices, scores, 5)
+            patches_search(f, buffers, indices, scores, 10)
 
         self.pm_previous[l] = (indices, scores)
         return indices, scores
@@ -528,7 +532,7 @@ class NeuralGenerator(object):
 
         flat_idx = np.sum(best_idx.reshape((-1,3)) * np.array([B.shape[1]*B.shape[2], B.shape[2], 1]), axis=(1))
         used = 99. * len(set(flat_idx)) / flat_idx.shape[0]
-        duplicates = 99. * len([v for v in np.bincount(flat_idx) if v>1]) / flat_idx.shape[0]
+        duplicates = 99. * len([v for v in np.bincount(flat_idx) if v>1]) / len(set(flat_idx))
         changed = 99. * (1.0 - np.where(indices == flat_idx)[0].shape[0] / flat_idx.shape[0])
 
         err = best_val.mean()
@@ -546,10 +550,10 @@ class NeuralGenerator(object):
             content_weight, noise_weight, variety, iterations = p
             for j in range(iterations):
                 blended = sum([a*w for a, w in self.layer_inputs[i]]) / sum([w for _, w in self.layer_inputs[i]])
-                # self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+                self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
                 feature = blended * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
-                # self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
                 result = self.evaluate_feature(l, feature, variety)
                 self.render(result, l, 'output-L{}I{}'.format(l, j+1))
                 self.layer_inputs[i][i].array[:] = result 
