@@ -24,6 +24,7 @@ import sys
 import math
 import time
 import pickle
+import random
 import argparse
 import itertools
 import collections
@@ -242,21 +243,56 @@ class Model(object):
         return scipy.misc.imresize(image, resolution, interp='bicubic')
 
 
+#----------------------------------------------------------------------------------------------------------------------
+# Fast Patch Matching
+#----------------------------------------------------------------------------------------------------------------------
 
-@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:,:], numba.int32[:,:], numba.float32[:,:])],
-                    '(n,c,x,y),(n,c,z,w),(a,b,m,i)->(a,b),(a,b)', nopython=True, target='parallel')
-def compute_matches(inputs, buffers, indices, selected, best):
-    for a in range(indices.shape[0]):
-        for b in range(indices.shape[1]):
-            scores = np.zeros((indices.shape[2],), dtype=np.float32)
-            for m in range(indices.shape[2]):
-                i0, i1, i2 = indices[a,b,m,0], indices[a,b,m,1], indices[a,b,m,2]
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:])],
+                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b)', nopython=True, target='parallel')
+def patches_initialize(current, buffers, indices, scores):
+    for b in range(indices.shape[0]):
+        for a in range(indices.shape[1]):
+            i0, i1, i2 = indices[b,a]
+            score = 0.0
+            for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
+                score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
+            scores[b,a] = score
+
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.float32[:])],
+                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b),()', nopython=True)
+def patches_propagate(current, buffers, indices, scores, i):
+    even = bool((i[0]%2)==0)
+    for b in range(0, indices.shape[0]) if even else range(indices.shape[0]-1, -1, -1):
+        for a in range(0, indices.shape[1]) if even else range(indices.shape[1]-1, -1, -1):
+            for offset in [(0, 0, -1 if even else +1), (0, -1 if even else +1, 0)]:
+                i0, i1, i2 = indices[min(indices.shape[0]-1, max(b+offset[1], 0)), min(indices.shape[1]-1, max(a+offset[2], 0))]\
+                                    - np.array(offset, dtype=np.int32)
+                i1 = min(buffers.shape[2]-2, max(i1, 1))
+                i2 = min(buffers.shape[3]-2, max(i2, 1))
+                score = 0.0
                 for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
-                    candidates = buffers[i0,:,i1+y,i2+x]
-                    reference = inputs[0,:,1+a+y,1+b+x]
-                    scores[m] += np.sum(candidates * reference)
-            selected[a,b] = scores.argmax()
-            best[a,b] = scores.max()
+                    score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
+                if score > scores[b,a]:
+                    scores[b,a] = score
+                    indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
+
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:])],
+                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b)', nopython=True, target='parallel')
+def patches_search(current, buffers, indices, scores):
+    for b in range(indices.shape[0]):
+        for a in range(indices.shape[1]):
+            i0, i1, i2 = indices[b,a]
+            for w in range(8):
+                # i1 = min(buffers.shape[2]-2, max(i1 + random.randint(-w, +w), 1))
+                # i2 = min(buffers.shape[3]-2, max(i2 + random.randint(-w, +w), 1))
+                i1 = random.randint(1,buffers.shape[2]-2)
+                i2 = random.randint(1,buffers.shape[3]-2)
+                score = 0.0
+                for y, x in [(-1,-1),(-1,0),(-1,+1),(0,-1),(0,0),(0,+1),(+1,-1),(+1,0),(+1,+1)]:
+                    score += np.sum(buffers[i0,:,i1+y,i2+x] * current[0,:,1+b+y,1+a+x])
+                if score > scores[b,a]:
+                    scores[b,a] = score
+                    indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
 
 
 #----------------------------------------------------------------------------------------------------------------------
@@ -357,17 +393,16 @@ class NeuralGenerator(object):
             output = lasagne.layers.get_output(self.model.network['sem%i'%layer],
                                               {self.model.network['lat'+input]: tensor_latent,
                                                self.model.network['map']: self.model.tensor_map})
-            fn = self.compile([tensor_latent, self.model.tensor_map], [output] + self.do_extract_patches(layer, output))
+            fn = self.compile([tensor_latent, self.model.tensor_map], [output] + self.compute_norms(T, layer, output))
             self.encoders.append(fn)
 
-        # Store all the style patches layer by layer, resized to match slice size and cast to 16-bit for size. 
+        # Store all the style patches layer by layer, resized to match slice size and cast to 16-bit for size.
         self.style_data, feature = {}, self.style_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *data = encoder(feature, self.style_map)
-            feature, patches = feature[:,:self.model.channels[layer]], data[0]
-            self.style_data[layer] = [d.astype(np.float16) for d in data]\
-                                   + [np.zeros((patches.shape[0],), dtype=np.float16), -1]
-            print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, patches.shape[:2], patches.shape[2:], patches.size//1000))
+            self.style_data[layer] = [d.astype(np.float16) for d in [feature]+data]\
+                                   + [np.zeros((feature.shape[0],), dtype=np.float16), -1]
+            print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, feature.shape[:2], feature.shape[2:], feature.size//1000))
 
     def prepare_content(self, scale=1.0):
         """Called each phase of the optimization, rescale the original content image and its map to use as inputs.
@@ -415,17 +450,16 @@ class NeuralGenerator(object):
             feature = feature[:,:self.model.channels[layer]]
             style = self.style_data[layer][0]
 
-            sn, sx = style.min(axis=(0,2,3), keepdims=True), style.max(axis=(0,2,3), keepdims=True)
-            cn, cx = feature.min(axis=(0,2,3), keepdims=True), feature.max(axis=(0,2,3), keepdims=True)
-
-            self.content_features.insert(0, sn + (feature - cn) * (sx - sn) / (cx - cn))
+            # sn, sx = style.min(axis=(0,2,3), keepdims=True), style.max(axis=(0,2,3), keepdims=True)
+            # cn, cx = feature.min(axis=(0,2,3), keepdims=True), feature.max(axis=(0,2,3), keepdims=True)
+            # self.content_features.insert(0, sn + (feature - cn) * (sx - sn) / (cx - cn))
+            self.content_features.insert(0, feature)
             print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
 
     def prepare_generation(self):
         """Layerwise synthesis images requires two sets of Theano functions to be compiled.
         """
         # Patch matching calculation that uses only pre-calculated features and a slice of the patches.
-        # self.compute_matches = {l: self.compile([self.model.pm_inputs[l], self.model.pm_buffers[l], self.model.pm_candidates[l]], self.do_match_patches(l)) for l in args.layers}
         self.pm_previous = {}
         LayerInput = collections.namedtuple('LayerInput', ['array', 'weight'])
         self.layer_inputs = [[LayerInput(np.copy(self.content_features[i]), w) for _, w in zip(args.layers, extend(args.layer_weight))]
@@ -450,17 +484,6 @@ class NeuralGenerator(object):
 
 
     #------------------------------------------------------------------------------------------------------------------
-    # Theano Computation
-    #------------------------------------------------------------------------------------------------------------------
-
-    def do_extract_patches(self, layer, output):
-        """This function builds a Theano expression that will get compiled an run on the GPU. It extracts 3x3 patches
-        from the intermediate outputs in the model.
-        """
-        return [output] + self.compute_norms(T, layer, output)
-
-
-    #------------------------------------------------------------------------------------------------------------------
     # Optimization Loop
     #------------------------------------------------------------------------------------------------------------------
 
@@ -469,59 +492,36 @@ class NeuralGenerator(object):
         self.normalize_components(l, buffers, self.style_data[l][1:3])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
-        SAMPLES = 24
-        indices = np.zeros((f.shape[2]-2, f.shape[3]-2, SAMPLES, 3), dtype=np.int32) # TODO: patchsize
+        scores = np.zeros((f.shape[2]-2, f.shape[3]-2), dtype=np.float32)   # TODO: patchsize
+        indices = np.zeros((f.shape[2]-2, f.shape[3]-2, 3), dtype=np.int32) # TODO: patchsize
+        indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
+        indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
 
-        ref_idx, ref_val = self.pm_previous.get(l, (None, 0.0))
-        for i in itertools.count():
-            indices[:,:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:3]) # TODO: patchsize
-            indices[:,:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:3]) # TODO: patchsize
+        # Identity initialization.
+        # indices[:,:,1:] = np.indices(f.shape[2:]).transpose((1,2,0))[1:-1,1:-1]
+        # Propagation test.
+        # indices[:,:,1:] = 1
 
-            if ref_idx is not None:
-                indices[:,:,0,:] = ref_idx + (0,0,0)
-                indices[:,:,1,:] = ref_idx + (0,0,+1)
-                indices[:,:,2,:] = ref_idx + (0,+1,0)
-                indices[:,:,3,:] = ref_idx + (0,0,-1)
-                indices[:,:,4,:] = ref_idx + (0,-1,0)
+        t = time.time()
+        patches_initialize(f, buffers, indices, scores)
+        print('patches_initialize', time.time() - t)
 
-                indices[:-1,:,5,:] = ref_idx[+1:,:] + (0,-1,0)
-                indices[+1:,:,6,:] = ref_idx[:-1,:] + (0,+1,0)
-                indices[:,:-1,7,:] = ref_idx[:,+1:] + (0,0,-1)
-                indices[:,+1:,8,:] = ref_idx[:,:-1] + (0,0,+1)
-
-                indices[:,:,:9,1].clip(1, buffers.shape[2]-2, out=indices[:,:,:9,1])
-                indices[:,:,:9,2].clip(1, buffers.shape[3]-2, out=indices[:,:,:9,2])
-            
-            previous = self.pm_previous.get(l+1, None)
-            if i == 0 and previous is not None:
-                prev_idx, ref_val = previous
-                resh_idx = np.concatenate([scipy.ndimage.zoom(np.pad(prev_idx[:,:,i]*2, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis] for i in range(1, 3)], axis=(2))
-                indices[:,:,10,1:] = resh_idx[+1:-1,+1:-1]
-                indices[:,:,11,1:] = resh_idx[+2:  ,+2:  ]
-                indices[:,:,12,1:] = resh_idx[+2:  ,  :-2]
-                indices[:,:,13,1:] = resh_idx[  :-2,+2:  ]
-                indices[:,:,14,1:] = resh_idx[  :-2,  :-2]
-                
-                indices[:,:,10:15,1].clip(1, buffers.shape[2]-2, out=indices[:,:,10:15,1])
-                indices[:,:,10:15,2].clip(1, buffers.shape[3]-2, out=indices[:,:,10:15,2])
-            
+        for i in range(24):
             t = time.time()
-            best_idx, best_val = compute_matches(f, buffers, indices)
-            print('patch_match', time.time() - t)
+            print(np.percentile(scores, [5.0, 25.0, 75.0, 95.0]))
+            patches_propagate(f, buffers, indices, scores, i)
+            patches_search(f, buffers, indices, scores)
+            print('patches_propagate', i, time.time() - t)
 
-            # Numpy array indexing rules seem to require injecting the identity matrix back into the array.
-            identity = np.indices(f.shape[2:]).transpose((1,2,0))[:-2,:-2] + 1 # TODO: patchsize
-            accessors = np.concatenate([identity - 1, best_idx[:,:,np.newaxis]], axis=2)
-            ref_idx = indices[accessors[:,:,0],accessors[:,:,1],accessors[:,:,2]]
+        """"
+            previous = self.pm_previous.get(l+1, None)
+            prev_idx, ref_val = previous
+            resh_idx = np.concatenate([scipy.ndimage.zoom(np.pad(prev_idx[:,:,i]*2, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis] for i in range(1, 3)], axis=(2))
+            indices[:,:,10,1:] = resh_idx[+1:-1,+1:-1]
+        """
 
-            rv = np.percentile(best_val, 5.0)
-            print('values', ref_idx.shape, (rv - ref_val) / rv, rv - ref_val, rv)
-            if abs(rv - ref_val) < 0.00005:
-                break
-            ref_val = rv
-
-        self.pm_previous[l] = (ref_idx, ref_val)
-        return ref_idx, best_val
+        self.pm_previous[l] = (indices, scores)
+        return indices, scores
 
     def evaluate_feature(self, layer, feature, variety=0.0):
         """Compute best matching patches for this layer, then merge patches into a single feature array of same size.
@@ -604,7 +604,7 @@ class NeuralGenerator(object):
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
         """
-        self.model.setup(layers=['enc%i_1'%l for l in args.layers] + ['sem%i'%l for l in args.layers] + ['dec%i_1'%l for l in args.layers])
+        self.model.setup(layers=['enc%i_1'%l for l in args.layers] + ['sem%i'%l for l in args.layers] + ['dec%i_1'%l for l in args.layers[1:]])
         self.prepare_style()
         self.prepare_content()
         self.prepare_generation()
