@@ -42,7 +42,8 @@ add_arg('--layer-weight',    default=[1.0], nargs='+',      type=float, help='We
 add_arg('--content-weight',  default=[.3,.2,.1], nargs='+', type=float, help='Weight of input content features each layer.')
 add_arg('--noise-weight',    default=[.2,.1,.0], nargs='+', type=float, help='Weight of noise added into features.')
 add_arg('--iterations',      default=[4, 4, 1], nargs='+',  type=int,   help='Number of times to repeat layer optimization.')
-add_arg('--shapes',          default=[3], nargs='+', type=int,     help='Size of kernels used for patch extraction.')
+add_arg('--shapes',          default=[3], nargs='+', type=int,          help='Size of kernels used for patch extraction.')
+add_arg('--quality',         default=0.002, type=float,      help='Threshold of improvement to stop patch matching.')
 add_arg('--seed',            default=None, type=int,         help='Initial state for the random number generator.')
 add_arg('--semantic-ext',    default='_sem.png', type=str,   help='File extension for the semantic maps.')
 add_arg('--semantic-weight', default=0.0, type=float,        help='Global weight of semantics vs. style features.')
@@ -132,7 +133,7 @@ class Model(object):
         for j in range(6):
             net['map%i'%(j+1)] = PoolLayer(net['map'], 2**j, mode='average_exc_pad')
 
-        self.tensor_latent = []
+        self.tensor_img, self.tensor_map, self.tensor_latent = T.tensor4(), T.tensor4(), []
         for l in args.layers:
             self.tensor_latent.append((str(l), T.tensor4()))
             net['lat%i'%l] = InputLayer((None, self.units[l], None, None), var=self.tensor_latent[-1][1])
@@ -208,20 +209,6 @@ class Model(object):
                                                        .format(layer, p.get_value().shape, v.shape)
                 p.set_value(v.astype(np.float32))
 
-    def setup(self, layers):
-        """Setup the inputs and outputs, knowing the layers that are required by the optimization algorithm.
-        """
-        self.tensor_img = T.tensor4()
-        self.tensor_map = T.tensor4()
-        tensor_inputs = {self.network['img']: self.tensor_img, self.network['map']: self.tensor_map}
-        outputs = lasagne.layers.get_output([self.network[l] for l in layers], tensor_inputs)
-        self.tensor_outputs = {k: v for k, v in zip(layers, outputs)}
-
-    def get_outputs(self, type, layers):
-        """Fetch the output tensors for the network layers.
-        """
-        return [self.tensor_outputs[type+l] for l in layers]
-
     def prepare_image(self, image):
         """Given an image loaded from disk, turn it into a representation compatible with the model. The format is
         (b,c,y,x) with batch=1 for a single image, channels=3 for RGB, and y,x matching the resolution.
@@ -257,35 +244,35 @@ def patches_initialize(current, buffers, indices, scores):
             i0, i1, i2 = indices[b,a]
             scores[b,a] = patches_score(current, buffers, i0, i1, i2, b, a)
 
-@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.float32[:])],
-                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b),()', nopython=True)
-def patches_propagate(current, buffers, indices, scores, i):
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.float32[:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.float32[:])],
+                    '(n,c,x,y),(n,c,z,w),(n,z,w),(a,b,i),(a,b),()', nopython=True)
+def patches_propagate(current, buffers, biases, indices, scores, i):
     even = bool((i[0]%2)==0)
     for b in range(0, indices.shape[0]) if even else range(indices.shape[0]-1, -1, -1):
         for a in range(0, indices.shape[1]) if even else range(indices.shape[1]-1, -1, -1):
             for offset in [(0, 0, -1 if even else +1), (0, -1 if even else +1, 0)]:
                 i0, i1, i2 = indices[min(indices.shape[0]-1, max(b+offset[1], 0)), min(indices.shape[1]-1, max(a+offset[2], 0))]\
                                     - np.array(offset, dtype=np.int32)
-                i1 = min(buffers.shape[2]-2, max(i1, 1))
-                i2 = min(buffers.shape[3]-2, max(i2, 1))
+                i1, i2 = min(buffers.shape[2]-2, max(i1, 1)), min(buffers.shape[3]-2, max(i2, 1))
+                j0, j1, j2 = indices[b,a]
                 score = patches_score(current, buffers, i0, i1, i2, b, a)
-                if score > scores[b,a]:
+                if score + biases[i0,i1,i2] > scores[b,a] + biases[j0,j1,j2]:
                     scores[b,a] = score
                     indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
 
-@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.int32[:])],
-                    '(n,c,x,y),(n,c,z,w),(a,b,i),(a,b),()', nopython=True, target='parallel')
-def patches_search(current, buffers, indices, scores, k):
+@numba.guvectorize([(numba.float32[:,:,:,:], numba.float32[:,:,:,:], numba.float32[:,:,:], numba.int32[:,:,:], numba.float32[:,:], numba.int32[:])],
+                    '(n,c,x,y),(n,c,z,w),(n,z,w),(a,b,i),(a,b),()', nopython=True, target='parallel')
+def patches_search(current, buffers, biases, indices, scores, k):
     for b in range(indices.shape[0]):
         for a in range(indices.shape[1]):
             i0, i1, i2 = indices[b,a]
             for w in range(k[0]):
                 # i1 = min(buffers.shape[2]-2, max(i1 + random.randint(-w, +w), 1))
                 # i2 = min(buffers.shape[3]-2, max(i2 + random.randint(-w, +w), 1))
-                i1 = np.random.randint(1, buffers.shape[2]-1)
-                i2 = np.random.randint(1, buffers.shape[3]-1)
+                i1, i2 = np.random.randint(1, buffers.shape[2]-1), np.random.randint(1, buffers.shape[3]-1)
+                j0, j1, j2 = indices[b,a]
                 score = patches_score(current, buffers, i0, i1, i2, b, a)
-                if score > scores[b,a]:
+                if score + biases[i0,i1,i2] > scores[b,a] + biases[j0,j1,j2]:
                     scores[b,a] = score
                     indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
 
@@ -459,6 +446,7 @@ class NeuralGenerator(object):
         self.layer_inputs = [[LayerInput(np.copy(self.content_features[i]), w) for _, w in zip(args.layers, extend(args.layer_weight))]
                                                                                for i, _ in enumerate(args.layers)]
 
+    def prepare_network(self):
         # Decoding intermediate features into more specialized features and all the way to the output image.
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
         for name, (input, tensor_latent) in zip(args.layers, input_tensors):
@@ -486,13 +474,24 @@ class NeuralGenerator(object):
         self.normalize_components(l, buffers, self.style_data[l][1:3])
         self.normalize_components(l, f, self.compute_norms(np, l, f))
 
+        biases = np.zeros((buffers.shape[0],)+buffers.shape[2:], dtype=np.float32)
         scores = np.zeros((f.shape[2]-2, f.shape[3]-2), dtype=np.float32)   # TODO: patchsize
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, 3), dtype=np.int32) # TODO: patchsize
 
-        previous = self.pm_previous.get(l+1, None) 
+        """
+        cur_gram = f.reshape((f.shape[1], -1))
+        cur_gram = np.tensordot(cur_gram, cur_gram.T, axes=(1,0))
+
+        sty_gram = buffers.reshape((buffers.shape[1], -1))
+        sty_gram = np.tensordot(sty_gram, sty_gram.T, axes=(1,0))
+
+        adjust = sty_gram - cur_gram
+        """
+
+        previous = self.pm_previous.get(l+1, None)
         if previous is not None:
-            def rescale(a): return scipy.ndimage.zoom(np.pad(a, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis]
-            indices[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1]
+            def rescale(a): return scipy.ndimage.zoom(np.pad(a, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis]     # TODO: patchsize
+            indices[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1] # TODO: patchsize
         else:
             indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
             indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
@@ -503,9 +502,12 @@ class NeuralGenerator(object):
             w = np.where(s > scores)
             indices[w], scores[w] = i[w], s[w]
 
-        for i in range((l-1)**2):
-            patches_propagate(f, buffers, indices, scores, i)
-            patches_search(f, buffers, indices, scores, 10)
+        m = scores.mean()
+        for i in itertools.count():
+            patches_propagate(f, buffers, biases, indices, scores, i)
+            patches_search(f, buffers, biases, indices, scores, 10)
+            m, s = scores.mean(), m
+            if m - s < args.quality: break
 
         self.pm_previous[l] = (indices, scores)
         return indices, scores
@@ -590,10 +592,10 @@ class NeuralGenerator(object):
     def run(self):
         """The main entry point for the application, runs through multiple phases at increasing resolutions.
         """
-        self.model.setup(layers=['enc%i_1'%l for l in args.layers] + ['sem%i'%l for l in args.layers] + ['dec%i_1'%l for l in args.layers[1:]])
         self.prepare_style()
         self.prepare_content()
         self.prepare_generation()
+        self.prepare_network()
 
         Xn = self.evaluate((self.content_img[0] + 1.0) * 127.5)
         output = self.model.finalize_image(Xn.reshape(self.content_img.shape[1:]), self.content_shape)
