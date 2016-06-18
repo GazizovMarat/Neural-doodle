@@ -447,7 +447,6 @@ class NeuralGenerator(object):
                                                                                for i, _ in enumerate(args.layers)]
 
     def prepare_network(self):
-        # Decoding intermediate features into more specialized features and all the way to the output image.
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
         for name, (input, tensor_latent) in zip(args.layers, input_tensors):
             layer = lasagne.layers.get_output(self.model.network['enc%i_1'%name],
@@ -456,6 +455,7 @@ class NeuralGenerator(object):
             fn = self.compile([tensor_latent, self.model.tensor_map], layer)
             self.encoders.append(fn)
 
+        # Decoding intermediate features into more specialized features and all the way to the output image.
         self.decoders, output_layers = [], (['dec%i_1'%l for l in args.layers[1:]] + ['out'])
         for name, (input, tensor_latent), output in zip(args.layers, self.model.tensor_latent, output_layers):
             layer = lasagne.layers.get_output(self.model.network[output],
@@ -478,15 +478,23 @@ class NeuralGenerator(object):
         scores = np.zeros((f.shape[2]-2, f.shape[3]-2), dtype=np.float32)   # TODO: patchsize
         indices = np.zeros((f.shape[2]-2, f.shape[3]-2, 3), dtype=np.int32) # TODO: patchsize
 
-        """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Patch-variety experiment that boosts the scores of patches that are clearly distinct from
+        # the current statistical distribution.
+        # 
+        # TODO: Move the `for` loop into a numba vectorized function that can be run in parallel. 
+
+        # sty_gram = buffers.reshape((buffers.shape[1], -1))
+        # sty_gram = np.tensordot(sty_gram, sty_gram, axes=(1,1))
+
         cur_gram = f.reshape((f.shape[1], -1))
-        cur_gram = np.tensordot(cur_gram, cur_gram.T, axes=(1,0))
+        cur_gram = np.tensordot(cur_gram, cur_gram, axes=(1,1)) / cur_gram.shape[1]
 
-        sty_gram = buffers.reshape((buffers.shape[1], -1))
-        sty_gram = np.tensordot(sty_gram, sty_gram.T, axes=(1,0))
+        for y, x in itertools.product(range(buffers.shape[2]), range(buffers.shape[3])):
+            pix_gram = buffers[0,:,y,x].reshape((-1,1)) * buffers[0,:,y,x].reshape((1,-1))
+            biases[0,y,x] = np.sum((pix_gram - cur_gram) ** 2.0) * 50.0
 
-        adjust = sty_gram - cur_gram
-        """
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         previous = self.pm_previous.get(l+1, None)
         if previous is not None:
