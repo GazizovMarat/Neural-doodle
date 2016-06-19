@@ -266,10 +266,10 @@ def patches_search(current, buffers, biases, indices, scores, k):
     for b in range(indices.shape[0]):
         for a in range(indices.shape[1]):
             i0, i1, i2 = indices[b,a]
-            for w in range(k[0]):
-                # i1 = min(buffers.shape[2]-2, max(i1 + random.randint(-w, +w), 1))
-                # i2 = min(buffers.shape[3]-2, max(i2 + random.randint(-w, +w), 1))
-                i1, i2 = np.random.randint(1, buffers.shape[2]-1), np.random.randint(1, buffers.shape[3]-1)
+            for radius in range(k[0], 0, -1):
+                w = 2 ** radius
+                i1 = min(buffers.shape[2]-2, max(i1 + np.random.randint(-w, +w), 1))
+                i2 = min(buffers.shape[3]-2, max(i2 + np.random.randint(-w, +w), 1))
                 j0, j1, j2 = indices[b,a]
                 score = patches_score(current, buffers, i0, i1, i2, b, a)
                 if score + biases[i0,i1,i2] > scores[b,a] + biases[j0,j1,j2]:
@@ -431,10 +431,7 @@ class NeuralGenerator(object):
             feature, *_ = encoder(feature, self.content_map)
             feature = feature[:,:self.model.channels[layer]]
             style = self.style_data[layer][0]
-
-            sn, sx = style.min(axis=(0,2,3), keepdims=True), style.max(axis=(0,2,3), keepdims=True)
-            cn, cx = feature.min(axis=(0,2,3), keepdims=True), feature.max(axis=(0,2,3), keepdims=True)
-            self.content_features.insert(0, sn + (feature - cn) * (sx - sn) / (cx - cn))
+            self.content_features.insert(0, feature)
             print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
 
     def prepare_generation(self):
@@ -484,15 +481,16 @@ class NeuralGenerator(object):
         # 
         # TODO: Move the `for` loop into a numba vectorized function that can be run in parallel. 
 
-        # sty_gram = buffers.reshape((buffers.shape[1], -1))
-        # sty_gram = np.tensordot(sty_gram, sty_gram, axes=(1,1))
+        sty_gram = buffers.reshape((buffers.shape[1], -1))
+        sty_gram = np.tensordot(sty_gram, sty_gram, axes=(1,1)) / sty_gram.shape[1]
 
         cur_gram = f.reshape((f.shape[1], -1))
         cur_gram = np.tensordot(cur_gram, cur_gram, axes=(1,1)) / cur_gram.shape[1]
 
         for y, x in itertools.product(range(buffers.shape[2]), range(buffers.shape[3])):
             pix_gram = buffers[0,:,y,x].reshape((-1,1)) * buffers[0,:,y,x].reshape((1,-1))
-            biases[0,y,x] = np.sum((pix_gram - cur_gram) ** 2.0) * 50.0
+            # biases[0,y,x] = np.sum((pix_gram - cur_gram) ** 2.0) * args.variety
+            biases[0,y,x] = np.sum((pix_gram - cur_gram) * (sty_gram - cur_gram)) * args.variety[0]
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -513,7 +511,7 @@ class NeuralGenerator(object):
         m = scores.mean()
         for i in itertools.count():
             patches_propagate(f, buffers, biases, indices, scores, i)
-            patches_search(f, buffers, biases, indices, scores, 10)
+            patches_search(f, buffers, biases, indices, scores, 8)
             m, s = scores.mean(), m
             if m - s < args.quality: break
 
@@ -556,10 +554,14 @@ class NeuralGenerator(object):
             content_weight, noise_weight, variety, iterations = p
             for j in range(iterations):
                 blended = sum([a*w for a, w in self.layer_inputs[i]]) / sum([w for _, w in self.layer_inputs[i]])
-                self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+                if len(self.layer_inputs[i]) > 1:
+                    self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+
                 feature = blended * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
-                self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                if content_weight not in (0.0, 1.0):
+                    self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+
                 result = self.evaluate_feature(l, feature, variety)
                 self.render(result, l, 'output-L{}I{}'.format(l, j+1))
                 self.layer_inputs[i][i].array[:] = result 
