@@ -127,19 +127,21 @@ class Model(object):
         and then adding augmentations for Semantic Style Transfer.
         """
         net, self.channels = {}, {}
-        self.units = {1: 48, 2: 80, 3: 128, 4: 208, 5: 328, 6: 536}
+        self.units = {1: 48, 2: 80, 3: 136, 4: 224}
 
         net['map'] = InputLayer((1, None, None, None))
+        net['pool'] = InputLayer((1, 3, None, None))
         for j in range(6):
             net['map%i'%(j+1)] = PoolLayer(net['map'], 2**j, mode='average_exc_pad')
+            net['pool%i'%(j+1)] = PoolLayer(net['pool'], 2**j, mode='average_exc_pad')
 
-        self.tensor_img, self.tensor_map, self.tensor_latent = T.tensor4(), T.tensor4(), []
+        self.tensor_img, self.tensor_pool, self.tensor_map, self.tensor_latent = T.tensor4(), T.tensor4(), T.tensor4(), []
         for l in args.layers:
             self.tensor_latent.append((str(l), T.tensor4()))
-            net['lat%i'%l] = InputLayer((None, self.units[l], None, None), var=self.tensor_latent[-1][1])
+            net['lat%i'%l] = InputLayer((None, 3+self.units[l], None, None), var=self.tensor_latent[-1][1])
 
         def EncdLayer(previous, channels, filter_size, pad, stride=(1,1), nonlinearity=lasagne.nonlinearities.elu):
-            incoming = net['lat'+previous[0]] if int(previous[0]) in args.layers and previous[1:] == '_1' else net['enc'+previous]
+            incoming = net['lat'+previous[0]] if int(previous[0]) in args.layers and previous[1:] == '_0' else net['enc'+previous]
             return ConvLayer(incoming, channels, filter_size, pad=pad, stride=stride, nonlinearity=nonlinearity)
 
         # Encoder part of the neural network, takes an input image and turns it into abstract patterns.
@@ -147,41 +149,39 @@ class Model(object):
         net['enc0_0'], net['lat0'] = net['img'], net['img']
         net['enc1_1'] = EncdLayer('0_0',  48, 3, pad=1)
         net['enc1_2'] = EncdLayer('1_1',  48, 3, pad=1)
-        net['enc2_1'] = EncdLayer('1_2',  80, 2, pad=0, stride=(2,2))
+        net['enc2_0-conv'] = EncdLayer('1_2',  80, 2, pad=0, stride=(2,2), nonlinearity=lasagne.nonlinearities.elu)
+        net['enc2_0'] = ConcatLayer([net['pool2'], net['enc2_0-conv']], axis=1)
+        net['enc2_0'].num_filters = net['enc2_0-conv'].num_filters + 3
+        net['enc2_1'] = EncdLayer('2_0',  80, 3, pad=1)
         net['enc2_2'] = EncdLayer('2_1',  80, 3, pad=1)
-        net['enc3_1'] = EncdLayer('2_2', 128, 2, pad=0, stride=(2,2))
-        net['enc3_2'] = EncdLayer('3_1', 128, 3, pad=1)
-        net['enc3_3'] = EncdLayer('3_2', 128, 3, pad=1)
-        net['enc4_1'] = EncdLayer('3_3', 208, 2, pad=0, stride=(2,2))
-        net['enc4_2'] = EncdLayer('4_1', 208, 3, pad=1)
-        net['enc4_3'] = EncdLayer('4_2', 208, 3, pad=1)
-        net['enc5_1'] = EncdLayer('4_3', 328, 2, pad=0, stride=(2,2))
-        net['enc5_2'] = EncdLayer('5_1', 328, 3, pad=1)
-        net['enc5_3'] = EncdLayer('5_2', 328, 3, pad=1)
-        net['enc6_1'] = EncdLayer('5_3', 536, 2, pad=0, stride=(2,2))
+        net['enc3_0-conv'] = EncdLayer('2_2',  136, 2, pad=0, stride=(2,2), nonlinearity=lasagne.nonlinearities.elu)
+        net['enc3_0'] = ConcatLayer([net['pool3'], net['enc3_0-conv']], axis=1)
+        net['enc3_0'].num_filters = net['enc3_0-conv'].num_filters + 3
+        net['enc3_1'] = EncdLayer('3_0',  136, 3, pad=1)
+        net['enc3_2'] = EncdLayer('3_1',  136, 3, pad=1)
+        net['enc3_3'] = EncdLayer('3_2',  136, 3, pad=1)
+        net['enc4_0-conv'] = EncdLayer('3_3',  224, 2, pad=0, stride=(2,2), nonlinearity=lasagne.nonlinearities.elu)
+        net['enc4_0'] = ConcatLayer([net['pool4'], net['enc4_0-conv']], axis=1)
+        net['enc4_0'].num_filters = net['enc4_0-conv'].num_filters + 3
 
         def DecdLayer(copy, previous, channels, nonlinearity=lasagne.nonlinearities.elu):
             # Dynamically injects intermediate "pitstop" output layers in the decoder based on what the user specified as layers.
-            dup, incoming = net['enc'+copy], net['lat'+copy[0]] if int(copy[0]) in args.layers and copy[1:] == '_1' else net[previous]
+            dup, incoming = net['enc'+copy], net['lat'+copy[0]] if int(copy[0]) in args.layers and '_0' in copy[1:] else net[previous]
             return DeconvLayer(incoming, channels, dup.filter_size, stride=dup.stride, crop=dup.pad, nonlinearity=nonlinearity)
 
         # Decoder part of the neural network, takes abstract patterns and converts them into an image!
-        net['dec5_3'] = DecdLayer('6_1', 'enc6_1', 328)
-        net['dec5_2'] = DecdLayer('5_3', 'dec5_3', 328)
-        net['dec5_1'] = DecdLayer('5_2', 'dec5_2', 328)
-        net['dec4_3'] = DecdLayer('5_1', 'dec5_1', 208)
-        net['dec4_2'] = DecdLayer('4_3', 'dec4_3', 208)
-        net['dec4_1'] = DecdLayer('4_2', 'dec4_2', 208)
-        net['dec3_3'] = DecdLayer('4_1', 'dec4_1', 128)
-        net['dec3_2'] = DecdLayer('3_3', 'dec3_3', 128)
-        net['dec3_1'] = DecdLayer('3_2', 'dec3_2', 128)
-        net['dec2_2'] = DecdLayer('3_1', 'dec3_1',  80)
+        net['dec3_3'] = DecdLayer('4_0-conv', 'enc4_0',  136)
+        net['dec3_2'] = DecdLayer('3_3', 'dec3_3',  136)
+        net['dec3_1'] = DecdLayer('3_2', 'dec3_2',  136)
+        net['dec3_0'] = DecdLayer('3_1', 'dec3_1',  139, nonlinearity=lasagne.nonlinearities.elu)
+        net['dec2_2'] = DecdLayer('3_0-conv', 'dec3_0',  80)
         net['dec2_1'] = DecdLayer('2_2', 'dec2_2',  80)
-        net['dec1_2'] = DecdLayer('2_1', 'dec2_1',  48)
+        net['dec2_0'] = DecdLayer('2_1', 'dec2_1',  83, nonlinearity=lasagne.nonlinearities.elu)
+        net['dec1_2'] = DecdLayer('2_0-conv', 'dec2_0',  48)
         net['dec1_1'] = DecdLayer('1_2', 'dec1_2',  48)
-        net['dec0_1'] = DecdLayer('1_1', 'dec1_1',   3, nonlinearity=lasagne.nonlinearities.tanh)
-        net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec0_1'], shared_axes=(0,1,2,3))
-        net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
+        net['dec1_0'] = DecdLayer('1_1', 'dec1_1',   3, nonlinearity=lasagne.nonlinearities.elu)
+        net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec1_0'], shared_axes=(0,1,2,3))
+        net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(255.0*(x+0.5), 0.0, 255.0))
 
         def ConcatenateLayer(incoming, layer):
             # TODO: The model is constructed too soon, we don't yet know if semantic_weight is needed. Fails if not.
@@ -189,8 +189,8 @@ class Model(object):
 
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
         for layer, upper, lower in zip(args.layers, [None] + args.layers[:-1], args.layers[1:] + [None]):
-            self.channels[layer] = net['enc%i_1'%layer].num_filters
-            net['sem%i'%layer] = ConcatenateLayer(net['enc%i_1'%layer], layer)
+            self.channels[layer] = net['enc%i_0'%layer].num_filters
+            net['sem%i'%layer] = ConcatenateLayer(net['enc%i_0'%layer], layer)
         self.network = net
 
     def load_data(self):
@@ -203,10 +203,17 @@ class Model(object):
 
         data = pickle.load(open(data_file, 'rb'))
         for layer, values in data.items():
-            if layer not in self.network: continue
+            if '.' in layer: continue # TODO: Filter out from data in first place.
+            if layer not in self.network:
+                print('problem', layer)
+                continue
             for p, v in zip(self.network[layer].get_params(), values):
-                assert p.get_value().shape == v.shape, "Layer `{}` in network has size {} but data is {}."\
-                                                       .format(layer, p.get_value().shape, v.shape)
+                ps = p.get_value().shape
+                if ps != v.shape:
+                    print("Layer `{}` in network has size {} but data is {}.".format(layer, ps, v.shape))
+                if len(ps) >= 2 and v.shape[1] > ps[1]: v = v[:,:ps[1]]
+                if len(ps) == 1 and v.shape[0] > ps[0]: v = v[:ps[0]]
+                assert ps == v.shape
                 p.set_value(v.astype(np.float32))
 
     def prepare_image(self, image):
@@ -214,7 +221,7 @@ class Model(object):
         (b,c,y,x) with batch=1 for a single image, channels=3 for RGB, and y,x matching the resolution.
         """
         image = np.swapaxes(np.swapaxes(image, 1, 2), 0, 1)[::-1, :, :]
-        image = image.astype(np.float32) / 127.5 - 1.0
+        image = image.astype(np.float32) / 255.0 - 0.5
         return image[np.newaxis]
 
     def finalize_image(self, image, resolution):
@@ -374,14 +381,15 @@ class NeuralGenerator(object):
         for layer, (input, tensor_latent), shape in zip(args.layers, input_tensors, extend(args.shapes)):
             output = lasagne.layers.get_output(self.model.network['sem%i'%layer],
                                               {self.model.network['lat'+input]: tensor_latent,
-                                               self.model.network['map']: self.model.tensor_map})
-            fn = self.compile([tensor_latent, self.model.tensor_map], [output] + self.compute_norms(T, layer, output))
+                                               self.model.network['map']: self.model.tensor_map,
+                                               self.model.network['pool']: self.model.tensor_pool})
+            fn = self.compile([tensor_latent, self.model.tensor_pool, self.model.tensor_map], [output] + self.compute_norms(T, layer, output))
             self.encoders.append(fn)
 
         # Store all the style patches layer by layer, resized to match slice size and cast to 16-bit for size.
         self.style_data, feature = {}, self.style_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
-            feature, *data = encoder(feature, self.style_map)
+            feature, *data = encoder(feature, self.style_img, self.style_map)
             self.style_data[layer] = [d.astype(np.float16) for d in [feature]+data]\
                                    + [np.zeros((feature.shape[0],), dtype=np.float16), -1]
             print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, feature.shape[:2], feature.shape[2:], feature.size//1000))
@@ -428,11 +436,12 @@ class NeuralGenerator(object):
         # Feed-forward calculation only, returns the result of the convolution post-activation
         self.content_features, feature = [], self.content_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
-            feature, *_ = encoder(feature, self.content_map)
+            feature, *_ = encoder(feature, self.content_img, self.content_map)
             feature = feature[:,:self.model.channels[layer]]
             style = self.style_data[layer][0]
             self.content_features.insert(0, feature)
             print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
+            print("\t", feature[:,:3].min(), feature[:,:3].max())
 
     def prepare_generation(self):
         """Layerwise synthesis images requires two sets of Theano functions to be compiled.
@@ -446,14 +455,15 @@ class NeuralGenerator(object):
     def prepare_network(self):
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
         for name, (input, tensor_latent) in zip(args.layers, input_tensors):
-            layer = lasagne.layers.get_output(self.model.network['enc%i_1'%name],
-                                             {self.model.network['lat'+input]: tensor_latent,
-                                              self.model.network['map']: self.model.tensor_map})
-            fn = self.compile([tensor_latent, self.model.tensor_map], layer)
+            layer = lasagne.layers.get_output(self.model.network['enc%i_0'%name],
+                                              {self.model.network['lat'+input]: tensor_latent,
+                                               self.model.network['map']: self.model.tensor_map,
+                                               self.model.network['pool']: self.model.tensor_pool})
+            fn = self.compile([tensor_latent, self.model.tensor_pool, self.model.tensor_map], layer)
             self.encoders.append(fn)
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
-        self.decoders, output_layers = [], (['dec%i_1'%l for l in args.layers[1:]] + ['out'])
+        self.decoders, output_layers = [], (['dec%i_0'%l for l in args.layers[1:]] + ['out'])
         for name, (input, tensor_latent), output in zip(args.layers, self.model.tensor_latent, output_layers):
             layer = lasagne.layers.get_output(self.model.network[output],
                                              {self.model.network['lat'+input]: tensor_latent,
@@ -501,17 +511,17 @@ class NeuralGenerator(object):
         else:
             indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
             indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
-        patches_initialize(f, buffers, indices, scores)
+        patches_initialize(f[:,3:], buffers[:,3:], indices, scores)
 
         if l in self.pm_previous:
             i, s = self.pm_previous[l]
-            w = np.where(s > scores)
+            w = np.where(s > scores) # TODO: add biases
             indices[w], scores[w] = i[w], s[w]
 
         m = scores.mean()
         for i in itertools.count():
-            patches_propagate(f, buffers, biases, indices, scores, i)
-            patches_search(f, buffers, biases, indices, scores, 8)
+            patches_propagate(f[:,3:], buffers[:,3:], biases, indices, scores, i)
+            patches_search(f[:,3:], buffers[:,3:], biases, indices, scores, 8)
             m, s = scores.mean(), m
             if m - s < args.quality: break
 
@@ -579,6 +589,7 @@ class NeuralGenerator(object):
         """
         self.frame = 0
         for i, c in zip(args.layers, self.content_features):
+            print('rendering layer', i)
             self.render(c, i, 'orig-L{}'.format(i))
 
         for j in range(args.passes):
@@ -592,11 +603,16 @@ class NeuralGenerator(object):
         """Decode features at a specific layer and save the result to disk for visualization. (Takes 50% more time.) 
         """
         if not args.frames: return
+        filename = os.path.splitext(os.path.basename(args.output))[0]
+
         for l, compute in list(zip(args.layers, self.decoders))[args.layers.index(layer):]:
+            img = features[0,:3][::-1]
+            print('min', img.min(), 'max', img.max())
+            scipy.misc.toimage(img * 255.0 + 127.5, cmin=0, cmax=255).save('frames/raw{}_{}-{:03d}-{}.png'.format(l, filename, self.frame, suffix))
+
             features = compute(features[:,:self.model.channels[l]], self.content_map)
 
         output = self.model.finalize_image(features.reshape(self.content_img.shape[1:]), self.content_shape)
-        filename = os.path.splitext(os.path.basename(args.output))[0]
         scipy.misc.toimage(output, cmin=0, cmax=255).save('frames/{}-{:03d}-{}.png'.format(filename, self.frame, suffix))
 
     def run(self):
@@ -607,7 +623,7 @@ class NeuralGenerator(object):
         self.prepare_generation()
         self.prepare_network()
 
-        Xn = self.evaluate((self.content_img[0] + 1.0) * 127.5)
+        Xn = self.evaluate((self.content_img[0] + 0.5) * 255.0)
         output = self.model.finalize_image(Xn.reshape(self.content_img.shape[1:]), self.content_shape)
         scipy.misc.toimage(output, cmin=0, cmax=255).save(args.output)
 
