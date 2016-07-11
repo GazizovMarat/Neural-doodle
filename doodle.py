@@ -51,7 +51,7 @@ add_arg('--output',          default='output.png', type=str, help='Filename or p
 add_arg('--output-size',     default=None, type=str,         help='Size of the output image, e.g. 512x512.')
 add_arg('--frames',          default=False, action='store_true',   help='Render intermediate frames, takes more time.')
 add_arg('--device',          default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
-add_arg('--model',           default='gelu3', type=str,      help='Filename for convolution weights of neural network.')
+add_arg('--model',           default='geln3', type=str,      help='Filename for convolution weights of neural network.')
 args = parser.parse_args()
 
 
@@ -181,7 +181,7 @@ class Model(object):
         net['dec1_1'] = DecdLayer('1_2', 'dec1_2',  48)
         net['dec0_1'] = DecdLayer('1_1', 'dec1_1',   3, nonlinearity=lasagne.nonlinearities.tanh)
         net['dec0_0'] = lasagne.layers.ScaleLayer(net['dec0_1'], shared_axes=(0,1,2,3))
-        net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(127.5*(x+1.0), 0.0, 255.0))
+        net['out']    = lasagne.layers.NonlinearityLayer(net['dec0_0'], nonlinearity=lambda x: T.clip(x, -1.0, +1.0))
 
         def ConcatenateLayer(incoming, layer):
             # TODO: The model is constructed too soon, we don't yet know if semantic_weight is needed. Fails if not.
@@ -213,15 +213,13 @@ class Model(object):
         """Given an image loaded from disk, turn it into a representation compatible with the model. The format is
         (b,c,y,x) with batch=1 for a single image, channels=3 for RGB, and y,x matching the resolution.
         """
-        image = np.swapaxes(np.swapaxes(image, 1, 2), 0, 1)[::-1, :, :]
-        image = image.astype(np.float32) / 127.5 - 1.0
-        return image[np.newaxis]
+        output = rgb2yuv(image.astype(np.float32) / 255.0)
+        return output.transpose((2, 0, 1))[np.newaxis]
 
     def finalize_image(self, image, resolution):
         """Convert network output into an image format that can be saved to disk, shuffling dimensions as appropriate.
         """
-        image = np.swapaxes(np.swapaxes(image[::-1], 0, 1), 1, 2)
-        image = np.clip(image, 0, 255).astype('uint8')
+        image = np.clip(yuv2rgb(image.transpose((1, 2, 0))) * 255.0, 0, 255).astype('uint8')
         return scipy.misc.imresize(image, resolution, interp='bicubic')
 
 
@@ -266,8 +264,8 @@ def patches_search(current, buffers, biases, indices, scores, k):
     for b in range(indices.shape[0]):
         for a in range(indices.shape[1]):
             i0, i1, i2 = indices[b,a]
-            for radius in range(k[0], 0, -1):
-                w = 2 ** radius
+            for radius in range(k[0]+1, 0, -1):
+                w = 2 ** (radius-1)
                 i1 = min(buffers.shape[2]-2, max(i1 + np.random.randint(-w, +w), 1))
                 i2 = min(buffers.shape[3]-2, max(i2 + np.random.randint(-w, +w), 1))
                 j0, j1, j2 = indices[b,a]
@@ -275,6 +273,18 @@ def patches_search(current, buffers, biases, indices, scores, k):
                 if score + biases[i0,i1,i2] > scores[b,a] + biases[j0,j1,j2]:
                     scores[b,a] = score
                     indices[b,a] = np.array((i0, i1, i2), dtype=np.int32)
+
+
+#----------------------------------------------------------------------------------------------------------------------
+# Color Conversions & Operations
+#----------------------------------------------------------------------------------------------------------------------
+
+yuv_from_rgb = np.array([[0.299, 0.587, 0.114], [-0.14714119, -0.28886916, 0.43601035], [0.61497538, -0.51496512, -0.10001026]], dtype=np.float32)
+rgb_from_yuv = np.linalg.inv(yuv_from_rgb)
+yuv_offset = np.array([0.5, 0.0, 0.0], dtype=np.float32)
+
+def yuv2rgb(yuv): return np.dot(yuv + yuv_offset, rgb_from_yuv.T)
+def rgb2yuv(rgb): return np.dot(rgb, yuv_from_rgb.T) - yuv_offset
 
 
 #----------------------------------------------------------------------------------------------------------------------
@@ -481,27 +491,40 @@ class NeuralGenerator(object):
         # 
         # TODO: Move the `for` loop into a numba vectorized function that can be run in parallel. 
 
-        sty_gram = buffers.reshape((buffers.shape[1], -1))
-        sty_gram = np.tensordot(sty_gram, sty_gram, axes=(1,1)) / sty_gram.shape[1]
+        if v > 0.0:
+            sty_gram = buffers.reshape((buffers.shape[1], -1))
+            sty_gram = np.tensordot(sty_gram, sty_gram, axes=(1,1)) / sty_gram.shape[1]
 
-        cur_gram = f.reshape((f.shape[1], -1))
-        cur_gram = np.tensordot(cur_gram, cur_gram, axes=(1,1)) / cur_gram.shape[1]
+            cur_gram = f.reshape((f.shape[1], -1))
+            cur_gram = np.tensordot(cur_gram, cur_gram, axes=(1,1)) / cur_gram.shape[1]
 
-        for y, x in itertools.product(range(buffers.shape[2]), range(buffers.shape[3])):
-            pix_gram = buffers[0,:,y,x].reshape((-1,1)) * buffers[0,:,y,x].reshape((1,-1))
-            # biases[0,y,x] = np.sum((pix_gram - cur_gram) ** 2.0) * args.variety
-            biases[0,y,x] = np.sum((pix_gram - cur_gram) * (sty_gram - cur_gram)) * args.variety[0]
+            for y, x in itertools.product(range(buffers.shape[2]), range(buffers.shape[3])):
+                pix_gram = buffers[0,:,y,x].reshape((-1,1)) * buffers[0,:,y,x].reshape((1,-1))
+                # Option #1 — Bias away from the current gram matrix to provide diversity.
+                # biases[0,y,x] = np.sum((pix_gram - cur_gram) ** 2.0) * args.variety
+
+                # Option #2 — Bias towards the target gram matrix to match the style.
+                biases[0,y,x] = np.sum((pix_gram - cur_gram) * (sty_gram - cur_gram)) * v
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         previous = self.pm_previous.get(l+1, None)
         if previous is not None:
             def rescale(a): return scipy.ndimage.zoom(np.pad(a, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis]     # TODO: patchsize
-            indices[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1] # TODO: patchsize
+            idx, scr = np.copy(indices), np.copy(scores)
+            idx[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1] # TODO: patchsize
+
+            patches_initialize(f, buffers, idx, scr)
+            for i in range(2):
+                patches_propagate(f, buffers, biases, idx, scr, i)
+                patches_search(f, buffers, biases, idx, scr, 1)
+
+            w = np.where(scr > scores)
+            indices[w], scores[w] = idx[w], scr[w]
         else:
             indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
             indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
-        patches_initialize(f, buffers, indices, scores)
+            patches_initialize(f, buffers, indices, scores)
 
         if l in self.pm_previous:
             i, s = self.pm_previous[l]
@@ -554,13 +577,11 @@ class NeuralGenerator(object):
             content_weight, noise_weight, variety, iterations = p
             for j in range(iterations):
                 blended = sum([a*w for a, w in self.layer_inputs[i]]) / sum([w for _, w in self.layer_inputs[i]])
-                if len(self.layer_inputs[i]) > 1:
-                    self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+                if len(self.layer_inputs[i]) > 1: self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
 
                 feature = blended * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
-                if content_weight not in (0.0, 1.0):
-                    self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                if content_weight not in (0.0, 1.0): self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
 
                 result = self.evaluate_feature(l, feature, variety)
                 self.render(result, l, 'output-L{}I{}'.format(l, j+1))
@@ -607,8 +628,8 @@ class NeuralGenerator(object):
         self.prepare_generation()
         self.prepare_network()
 
-        Xn = self.evaluate((self.content_img[0] + 1.0) * 127.5)
-        output = self.model.finalize_image(Xn.reshape(self.content_img.shape[1:]), self.content_shape)
+        output = self.evaluate(self.content_img[0])
+        output = self.model.finalize_image(output.reshape(self.content_img.shape[1:]), self.content_shape)
         scipy.misc.toimage(output, cmin=0, cmax=255).save(args.output)
 
         print('\n{}Optimization finished in {:3.1f}s!{}\n'.format(ansi.CYAN, time.time()-self.start_time,  ansi.ENDC))
