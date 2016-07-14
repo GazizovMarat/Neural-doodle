@@ -511,16 +511,12 @@ class NeuralGenerator(object):
         previous = self.pm_previous.get(l+1, None)
         if previous is not None:
             def rescale(a): return scipy.ndimage.zoom(np.pad(a, 1, mode='reflect'), 2, order=1)[:,:,np.newaxis]     # TODO: patchsize
-            idx, scr = np.copy(indices), np.copy(scores)
-            idx[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1] # TODO: patchsize
+            indices[:,:,1:] = np.concatenate([rescale(previous[0][:,:,i]*2) for i in [1,2]], axis=(2))[+1:-1,+1:-1] # TODO: patchsize
 
-            patches_initialize(f, buffers, idx, scr)
+            patches_initialize(f, buffers, indices, scores)
             for i in range(2):
-                patches_propagate(f, buffers, biases, idx, scr, i)
-                patches_search(f, buffers, biases, idx, scr, 1)
-
-            w = np.where(scr > scores)
-            indices[w], scores[w] = idx[w], scr[w]
+                patches_propagate(f, buffers, biases, indices, scores, i)
+                patches_search(f, buffers, biases, indices, scores, 1)
         else:
             indices[:,:,1] = np.random.randint(low=1, high=buffers.shape[2]-1, size=indices.shape[:2]) # TODO: patchsize
             indices[:,:,2] = np.random.randint(low=1, high=buffers.shape[3]-1, size=indices.shape[:2]) # TODO: patchsize
@@ -572,16 +568,23 @@ class NeuralGenerator(object):
 
     def evaluate_features(self):
         params = zip(*[extend(a) for a in [args.content_weight, args.noise_weight, args.variety, args.iterations]])
-        
+
         for i, (l, c, p) in enumerate(zip(args.layers, self.content_features, params)):
             content_weight, noise_weight, variety, iterations = p
             for j in range(iterations):
-                blended = sum([a*w for a, w in self.layer_inputs[i]]) / sum([w for _, w in self.layer_inputs[i]])
-                if len(self.layer_inputs[i]) > 1: self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
+                def weighted(w, k): return w if k<i or k==0 or (k==i and j!=0) else 0.0
 
+                # print('weights', [(k, weighted(w,k)) for k, (_, w) in enumerate(self.layer_inputs[i])])
+                # print('content', content_weight)
+
+                total = sum([weighted(w,k) for k, (_, w) in enumerate(self.layer_inputs[i])])
+                assert total > 0.0, "Layer weight for first layer should not be zero."
+                blended = sum([a*weighted(w,k) for k, (a, w) in enumerate(self.layer_inputs[i])]) / total
+
+                # if len(self.layer_inputs[i]) > 1: self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
                 feature = blended * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
-                if content_weight not in (0.0, 1.0): self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                # if content_weight not in (0.0, 1.0): self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
 
                 result = self.evaluate_feature(l, feature, variety)
                 self.render(result, l, 'output-L{}I{}'.format(l, j+1))

@@ -1,5 +1,11 @@
 FROM ubuntu:14.04
 
+# Miniconda.
+RUN echo 'export PATH=/opt/conda/bin:$PATH' > /etc/profile.d/conda.sh && \
+    wget --quiet https://repo.continuum.io/miniconda/Miniconda2-4.0.5-Linux-x86_64.sh -O ~/miniconda.sh && \
+    /bin/bash ~/miniconda.sh -b -p /opt/conda && \
+    rm ~/miniconda.sh
+
 # Install dependencies
 RUN apt-get -qq update           &&  \
     apt-get -qq install --assume-yes \
@@ -31,13 +37,14 @@ RUN apt-get -qq update           &&  \
 # Install requirements before copying project files
 WORKDIR /nd
 COPY requirements.txt .
-RUN python3 -m pip install -r "requirements.txt"
+RUN python3 -m pip install -r "requirements.txt" && \
+    conda update conda && conda install numba llvmlite
 
 # Copy only required project files
 COPY doodle.py .
 
 # Get a pre-trained neural network, non-commercial & attribution. (GELU2)
-RUN wget -q "https://github.com/alexjc/neural-doodle/releases/download/v0.0/gelu2_conv.pkl"
+RUN wget -q "https://github.com/alexjc/neural-doodle/releases/download/v0.0/geln3_conv.pkl"
 
 # Set an entrypoint to the main doodle.py script
 ENTRYPOINT ["python3", "doodle.py", "--device=cpu"]
