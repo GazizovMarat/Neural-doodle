@@ -4,19 +4,8 @@ FROM ubuntu:14.04
 RUN apt-get -qq update           &&  \
     apt-get -qq install --assume-yes \
         "build-essential"           \
-        "cmake"                     \
         "git"                       \
         "wget"                      \
-        "libopenjpeg2"              \
-        "libopenblas-dev"           \
-        "liblapack-dev"             \
-        "libjpeg-dev"               \
-        "libtiff5-dev"              \
-        "zlib1g-dev"                \
-        "libfreetype6-dev"          \
-        "liblcms2-dev"              \
-        "libwebp-dev"               \
-        "gfortran"                  \
         "pkg-config"             &&  \
     rm -rf /var/lib/apt/lists/*
 
@@ -28,9 +17,8 @@ RUN wget --quiet https://repo.continuum.io/miniconda/Miniconda3-4.0.5-Linux-x86_
 # Install requirements before copying project files
 WORKDIR /nd
 COPY requirements.txt .
-RUN /opt/conda/bin/conda install -y conda numpy llvmlite numba pip scikit-learn pillow
-RUN ls -R /opt/conda/
-RUN /opt/conda/bin/python3 -m pip install -r "requirements.txt"
+RUN /opt/conda/bin/conda install -q -y conda numpy llvmlite numba pip scikit-learn pillow
+RUN /opt/conda/bin/python3 -m pip install -q -r "requirements.txt"
 
 # Copy only required project files
 COPY doodle.py .
