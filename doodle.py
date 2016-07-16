@@ -36,12 +36,12 @@ add_arg = parser.add_argument
 add_arg('--content',         default=None, type=str,         help='Subject image path to repaint in new style.')
 add_arg('--style',           default=None, type=str,         help='Texture image path to extract patches from.')
 add_arg('--passes',          default=2, type=int,            help='Number of times to go over the whole image.')
-add_arg('--variety',         default=[.2,.1,.0], nargs='+', type=float, help='Bias selecting diverse patches')
+add_arg('--variety',         default=[0, 0, 0], nargs='+',  type=float, help='Bias selecting diverse patches')
 add_arg('--layers',          default=[5, 4, 3], nargs='+',  type=int,   help='The layers/scales to process.')
 add_arg('--layer-weight',    default=[1.0], nargs='+',      type=float, help='Weight of previous layer features.')
 add_arg('--content-weight',  default=[.3,.2,.1], nargs='+', type=float, help='Weight of input content features each layer.')
 add_arg('--noise-weight',    default=[.2,.1,.0], nargs='+', type=float, help='Weight of noise added into features.')
-add_arg('--iterations',      default=[4, 4, 1], nargs='+',  type=int,   help='Number of times to repeat layer optimization.')
+add_arg('--iterations',      default=[4, 3, 2], nargs='+',  type=int,   help='Number of times to repeat layer optimization.')
 add_arg('--shapes',          default=[3], nargs='+', type=int,          help='Size of kernels used for patch extraction.')
 add_arg('--quality',         default=0.002, type=float,      help='Threshold of improvement to stop patch matching.')
 add_arg('--seed',            default=None, type=int,         help='Initial state for the random number generator.')
@@ -190,7 +190,8 @@ class Model(object):
         # Auxiliary network for the semantic layers, and the nearest neighbors calculations.
         for layer, upper, lower in zip(args.layers, [None] + args.layers[:-1], args.layers[1:] + [None]):
             self.channels[layer] = net['enc%i_1'%layer].num_filters
-            net['sem%i'%layer] = ConcatenateLayer(net['enc%i_1'%layer], layer)
+            net['encs%i'%layer] = ConcatenateLayer(net['enc%i_1'%layer], layer)
+            net['decs%i'%layer] = ConcatenateLayer(net['dec%i_1'%layer], layer)
         self.network = net
 
     def load_data(self):
@@ -353,7 +354,6 @@ class NeuralGenerator(object):
 
     def normalize_components(self, layer, array, norms):
         if args.semantic_weight > 0.0:
-            print(layer, self.model.channels, len(norms))
             array[:,self.model.channels[layer]:] /= (norms[1] * args.semantic_weight)
         array[:,:self.model.channels[layer]] /= (norms[0] * 3.0)
 
@@ -382,7 +382,7 @@ class NeuralGenerator(object):
         input_tensors = self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
         self.encoders = []
         for layer, (input, tensor_latent), shape in zip(args.layers, input_tensors, extend(args.shapes)):
-            output = lasagne.layers.get_output(self.model.network['sem%i'%layer],
+            output = lasagne.layers.get_output(self.model.network['encs%i'%layer],
                                               {self.model.network['lat'+input]: tensor_latent,
                                                self.model.network['map']: self.model.tensor_map})
             fn = self.compile([tensor_latent, self.model.tensor_map], [output] + self.compute_norms(T, layer, output))
@@ -395,6 +395,7 @@ class NeuralGenerator(object):
             self.style_data[layer] = [d.astype(np.float16) for d in [feature]+data]\
                                    + [np.zeros((feature.shape[0],), dtype=np.float16), -1]
             print('  - Layer {} as {} patches {} in {:,}kb.'.format(layer, feature.shape[:2], feature.shape[2:], feature.size//1000))
+            feature = feature[:,:self.model.channels[layer]]
 
     def prepare_content(self, scale=1.0):
         """Called each phase of the optimization, rescale the original content image and its map to use as inputs.
@@ -439,10 +440,10 @@ class NeuralGenerator(object):
         self.content_features, feature = [], self.content_img
         for layer, encoder in reversed(list(zip(args.layers, self.encoders))):
             feature, *_ = encoder(feature, self.content_map)
-            feature = feature[:,:self.model.channels[layer]]
             style = self.style_data[layer][0]
             self.content_features.insert(0, feature)
             print("  - Layer {} as {} array in {:,}kb.".format(layer, feature.shape[1:], feature.size//1000))
+            feature = feature[:,:self.model.channels[layer]]
 
     def prepare_generation(self):
         """Layerwise synthesis images requires two sets of Theano functions to be compiled.
@@ -456,14 +457,14 @@ class NeuralGenerator(object):
     def prepare_network(self):
         self.encoders, input_tensors = [], self.model.tensor_latent[1:] + [('0', self.model.tensor_img)]
         for name, (input, tensor_latent) in zip(args.layers, input_tensors):
-            layer = lasagne.layers.get_output(self.model.network['enc%i_1'%name],
+            layer = lasagne.layers.get_output(self.model.network['encs%i'%name],
                                              {self.model.network['lat'+input]: tensor_latent,
                                               self.model.network['map']: self.model.tensor_map})
             fn = self.compile([tensor_latent, self.model.tensor_map], layer)
             self.encoders.append(fn)
 
         # Decoding intermediate features into more specialized features and all the way to the output image.
-        self.decoders, output_layers = [], (['dec%i_1'%l for l in args.layers[1:]] + ['out'])
+        self.decoders, output_layers = [], (['decs%i'%l for l in args.layers[1:]] + ['out'])
         for name, (input, tensor_latent), output in zip(args.layers, self.model.tensor_latent, output_layers):
             layer = lasagne.layers.get_output(self.model.network[output],
                                              {self.model.network['lat'+input]: tensor_latent,
@@ -574,9 +575,6 @@ class NeuralGenerator(object):
             for j in range(iterations):
                 def weighted(w, k): return w if k<i or k==0 or (k==i and j!=0) else 0.0
 
-                # print('weights', [(k, weighted(w,k)) for k, (_, w) in enumerate(self.layer_inputs[i])])
-                # print('content', content_weight)
-
                 total = sum([weighted(w,k) for k, (_, w) in enumerate(self.layer_inputs[i])])
                 assert total > 0.0, "Layer weight for first layer should not be zero."
                 blended = sum([a*weighted(w,k) for k, (a, w) in enumerate(self.layer_inputs[i])]) / total
@@ -584,7 +582,7 @@ class NeuralGenerator(object):
                 # if len(self.layer_inputs[i]) > 1: self.render(blended, l, 'blended-L{}I{}'.format(l, j+1))
                 feature = blended * (1.0 - content_weight) + c * content_weight \
                         + np.random.normal(0.0, 1.0, size=c.shape).astype(np.float32) * (0.1 * noise_weight)
-                # if content_weight not in (0.0, 1.0): self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
+                if content_weight not in (0.0, 1.0): self.render(feature, l, 'mixed-L{}I{}'.format(l, j+1))
 
                 result = self.evaluate_feature(l, feature, variety)
                 self.render(result, l, 'output-L{}I{}'.format(l, j+1))
@@ -592,11 +590,13 @@ class NeuralGenerator(object):
 
             if i+1 < len(args.layers):
                 for j in range(0, i+1):
-                    self.layer_inputs[i+1][j].array[:] = self.decoders[i](self.layer_inputs[i][j].array, self.content_map)
+                    array = self.layer_inputs[i][j].array[:,:self.model.channels[args.layers[i]]]
+                    self.layer_inputs[i+1][j].array[:] = self.decoders[i](array, self.content_map)
 
         for i in range(len(args.layers)-1, 0, -1):
             for j in range(i, len(args.layers)):
-                self.layer_inputs[i-1][j].array[:] = self.encoders[i-1](self.layer_inputs[i][j].array, self.content_map)
+                array = self.layer_inputs[i][j].array[:,:self.model.channels[args.layers[i]]]
+                self.layer_inputs[i-1][j].array[:] = self.encoders[i-1](array, self.content_map)
 
     def evaluate(self, Xn):
         """Feed-forward evaluation of the output based on current image. Can be called multiple times.
@@ -610,7 +610,7 @@ class NeuralGenerator(object):
             print('\n{}Pass #{}{}: variety {}, weights {}.{}'.format(ansi.CYAN_B, self.frame, ansi.CYAN, 0.0, 0.0, ansi.ENDC))
             self.evaluate_features()
 
-        return self.decoders[-1](self.layer_inputs[-1][-1].array, self.content_map)
+        return self.decoders[-1](self.layer_inputs[-1][-1].array[:,:self.model.channels[args.layers[-1]]], self.content_map)
 
     def render(self, features, layer, suffix):
         """Decode features at a specific layer and save the result to disk for visualization. (Takes 50% more time.) 
